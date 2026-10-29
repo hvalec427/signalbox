@@ -2,6 +2,7 @@
 # Print the version the next stable release will get, from the conventional
 # commits since the latest stable tag — the same rules semantic-release applies:
 # a breaking change bumps major, a feat bumps minor, anything else bumps patch.
+# Below 1.0 a breaking change bumps minor instead, so releases stay on 0.x.
 # Dev and nightly builds use it as their base, so they carry the upcoming version.
 set -euo pipefail
 
@@ -14,7 +15,11 @@ IFS=. read -r MAJOR MINOR PATCH <<< "${LATEST#v}"
 
 LOG=$(git log "${LATEST}..HEAD" --no-merges --format='%s%n%b')
 if grep -qE '^[a-z]+(\([^)]*\))?!:|^BREAKING[ -]CHANGE' <<< "${LOG}"; then
-  echo "$((MAJOR + 1)).0.0"
+  if [ "${MAJOR}" = 0 ]; then
+    echo "0.$((MINOR + 1)).0"
+  else
+    echo "$((MAJOR + 1)).0.0"
+  fi
 elif grep -qE '^feat(\([^)]*\))?:' <<< "${LOG}"; then
   echo "${MAJOR}.$((MINOR + 1)).0"
 else
