@@ -27,6 +27,43 @@ fn cdp_trace(tag: &str, msg: &str) {
     }
 }
 
+/// Per target: (cutoff, newest) console timestamps. Hermes caches console
+/// messages and replays them to every session that sends `Runtime.enable`, so a
+/// reconnect to the same VM would print its whole history again. `newest` is
+/// the latest timestamp seen; each (re)connect promotes it to `cutoff`, and
+/// anything at or before the cutoff is a replay of what we already showed.
+static CONSOLE_SEEN: OnceLock<Mutex<HashMap<String, (f64, f64)>>> = OnceLock::new();
+
+fn console_seen() -> std::sync::MutexGuard<'static, HashMap<String, (f64, f64)>> {
+    CONSOLE_SEEN.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap()
+}
+
+/// A new session to `key` started: what came before now counts as replay.
+fn start_console_session(key: &str) {
+    let mut seen = console_seen();
+    let e = seen.entry(key.to_string()).or_insert((f64::NEG_INFINITY, f64::NEG_INFINITY));
+    e.0 = e.1;
+}
+
+/// Record a console message's CDP timestamp; false when it's a replay.
+fn is_fresh_console(key: &str, ts: Option<f64>) -> bool {
+    let Some(ts) = ts else { return true };
+    let mut seen = console_seen();
+    let e = seen.entry(key.to_string()).or_insert((f64::NEG_INFINITY, f64::NEG_INFINITY));
+    if ts <= e.0 {
+        return false;
+    }
+    e.1 = e.1.max(ts);
+    true
+}
+
+/// RN's inspector greets every session that isn't React Native DevTools with
+/// "NOTE: You are using an unsupported debugging client…" and logs its
+/// "Debugger integration: …" banner on `Log.enable` — noise in our log view.
+fn is_host_notice(text: &str) -> bool {
+    text.contains("You are using an unsupported debugging client") || text.contains("Debugger integration: ")
+}
+
 // The DAP server lives in its own file but as a submodule here, so it can reach
 // ConnCmd/DebugEvent without touching main.rs (which carries unrelated WIP).
 #[path = "dap.rs"]
@@ -226,6 +263,7 @@ fn conn_loop(key: &str, url: &str, port: u16, tx: &Sender<RnEvent>, crx: Receive
         seq += 1;
         let _ = socket.send(tungstenite::Message::Text(json!({"id": seq, "method": method}).to_string()));
     };
+    start_console_session(key);
     send(&mut socket, "Runtime.enable");
     send(&mut socket, "Log.enable");
     send(&mut socket, "Network.enable");
@@ -424,9 +462,15 @@ fn handle_message(
         "Runtime.consoleAPICalled" => {
             let p = &msg["params"];
             learn_scripts(scripts, &p["stackTrace"]);
+            if !is_fresh_console(key, p["timestamp"].as_f64()) {
+                return;
+            }
             let level = p["type"].as_str().unwrap_or("log").to_string();
             let args = p["args"].as_array().cloned().unwrap_or_default();
             let text = args.iter().map(render_arg).collect::<Vec<_>>().join(" ");
+            if is_host_notice(&text) {
+                return;
+            }
             // Mirror to the editor's debug console (before `text`/`level` move).
             if let Some(de) = debug_sink.lock().unwrap().as_ref() {
                 let category = if level == "error" || level == "assert" { "stderr" } else { "stdout" };
@@ -449,14 +493,21 @@ fn handle_message(
         }
         "Log.entryAdded" => {
             let e = &msg["params"]["entry"];
+            let text = e["text"].as_str().unwrap_or("");
+            if is_host_notice(text) || !is_fresh_console(key, e["timestamp"].as_f64()) {
+                return;
+            }
             let _ = tx.send(RnEvent::Log(
                 key.into(),
-                LogEntry { kind: "console".into(), level: e["level"].as_str().unwrap_or("log").into(), text: e["text"].as_str().unwrap_or("").into(), expanded: None, stack: stack_frames(&e["stackTrace"], port) },
+                LogEntry { kind: "console".into(), level: e["level"].as_str().unwrap_or("log").into(), text: text.into(), expanded: None, stack: stack_frames(&e["stackTrace"], port) },
             ));
         }
         "Runtime.exceptionThrown" => {
             let d = &msg["params"]["exceptionDetails"];
             learn_scripts(scripts, &d["stackTrace"]);
+            if !is_fresh_console(key, msg["params"]["timestamp"].as_f64()) {
+                return;
+            }
             let text = d["exception"]["description"].as_str().or_else(|| d["text"].as_str()).unwrap_or("Uncaught exception").to_string();
             if let Some(de) = debug_sink.lock().unwrap().as_ref() {
                 let _ = de.send(DebugEvent::Output { category: "stderr".into(), output: format!("{text}\n") });
@@ -887,5 +938,38 @@ mod base64_lite {
             }
         }
         String::from_utf8_lossy(&out).into_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_drops_replayed_console_history() {
+        let key = "test-replay";
+        start_console_session(key);
+        assert!(is_fresh_console(key, Some(10.0)));
+        assert!(is_fresh_console(key, Some(20.0)));
+        start_console_session(key); // reconnect: Hermes replays 10 and 20
+        assert!(!is_fresh_console(key, Some(10.0)));
+        assert!(!is_fresh_console(key, Some(20.0)));
+        assert!(is_fresh_console(key, Some(30.0)));
+        assert!(is_fresh_console(key, None));
+    }
+
+    #[test]
+    fn same_session_keeps_messages_with_equal_timestamps() {
+        let key = "test-same-ms";
+        start_console_session(key);
+        assert!(is_fresh_console(key, Some(5.0)));
+        assert!(is_fresh_console(key, Some(5.0)));
+    }
+
+    #[test]
+    fn host_notices_are_recognised() {
+        assert!(is_host_notice("\x1b[1mNOTE: \x1b[22mYou are using an unsupported debugging client. Use the Dev Menu"));
+        assert!(is_host_notice("\x1b[48;2;253;247;231m\x1b[30mDebugger integration: iOS Bridgeless (RCTHost)"));
+        assert!(!is_host_notice("Running \"driverapp\" with {\"rootTag\":11}"));
     }
 }
