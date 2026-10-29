@@ -1,12 +1,12 @@
 [package]
-name = "metroctl"
+name = "signalbox"
 version = "0.0.0"
 edition = "2021"
 description = "React Native project dashboard (Metro, devices, logs) — built on simon"
-default-run = "metroctl"
+default-run = "signalbox"
 
 [[bin]]
-name = "metroctl"
+name = "signalbox"
 path = "src/main.rs"
 
 [dependencies]
@@ -24,7 +24,15 @@ crossterm = "0.28"
 portable-pty = "0.8"
 vt100 = "0.15"
 sourcemap = "9"
+signal-hook = "0.3"
 
 [profile.release]
 strip = true
 lto = true
+
+# vt100 0.15's visible_rows() computes `rows - scrollback_offset`, which
+# underflows once you scroll back more than a screen. Release builds wrap and
+# render correctly; keep dev builds from panicking on it. (0.16 fixes it but
+# conflicts with ratatui 0.29's pinned unicode-width.)
+[profile.dev.package.vt100]
+overflow-checks = false

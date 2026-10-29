@@ -6,23 +6,79 @@
 
 use crate::rn::{connect_cdp, fetch_targets};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-/// Optional CDP wire trace. Set METROCTL_CDP_DEBUG=/path/to/log to append every
-/// frame sent/received (and anything `await_result` drops) for debugging the
+/// Optional CDP wire trace. Set SIGNALBOX_CDP_DEBUG=/path/to/log to append every
+/// frame sent/received for debugging the
 /// Hermes/fusebox handshake. Resolved once per process.
 static CDP_TRACE: OnceLock<Option<String>> = OnceLock::new();
 
+/// The CDP binding React Native DevTools' frontend registers; the app's React
+/// DevTools backend sends its bridge messages through it.
+const DEVTOOLS_BINDING: &str = "__CHROME_DEVTOOLS_FRONTEND_BINDING__";
+
+/// Connect the app's React DevTools backend to us (React Native's Fusebox
+/// dispatcher, RN 0.76+). Replaces whichever frontend it had.
+const DEVTOOLS_INIT_JS: &str = "typeof __FUSEBOX_REACT_DEVTOOLS_DISPATCHER__ === 'undefined' ? 'missing' : (__FUSEBOX_REACT_DEVTOOLS_DISPATCHER__.initializeDomain('react-devtools'), 'ok')";
+
+/// Fixes React Native's tap-to-select (`s`) for pager pages and text; see the
+/// file. Idempotent; re-run after a reload.
+const DEVTOOLS_TAP_FIX_JS: &str = include_str!("devtools_tap_fix.js");
+
+/// Keeps prop edits through re-renders; see the file.
+const DEVTOOLS_PINS_JS: &str = include_str!("devtools_pins.js");
+
+/// The tap fix and the pins, as one script. `SIGNALBOX_PIN` picks how pins
+/// are kept: `a` re-applies them after each render (the default), `b` wraps
+/// the component's type, `off` leaves edits as React DevTools makes them.
+fn devtools_scripts() -> String {
+    let mode = match std::env::var("SIGNALBOX_PIN").as_deref() {
+        Ok("b") => "b",
+        Ok("off") => "off",
+        _ => "a",
+    };
+    format!("{DEVTOOLS_TAP_FIX_JS};\nglobalThis.__signalboxPinMode = '{mode}';\n{DEVTOOLS_PINS_JS}")
+}
+
+thread_local! {
+    /// Frames `await_result` read while waiting for a reply to its own command.
+    /// Each CDP connection has its own thread, so this is per-connection; the
+    /// read loops drain it before touching the socket so no event is lost.
+    static BACKLOG: RefCell<VecDeque<String>> = const { RefCell::new(VecDeque::new()) };
+}
+
+/// Next frame for this connection: a backlogged one first, else the socket.
+#[allow(clippy::result_large_err)] // tungstenite's own error type
+fn next_frame(
+    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+) -> tungstenite::Result<tungstenite::Message> {
+    match BACKLOG.with(|b| b.borrow_mut().pop_front()) {
+        Some(t) => Ok(tungstenite::Message::Text(t)),
+        None => socket.read(),
+    }
+}
+
 fn cdp_trace(tag: &str, msg: &str) {
-    let path = CDP_TRACE.get_or_init(|| std::env::var("METROCTL_CDP_DEBUG").ok());
+    let path = CDP_TRACE.get_or_init(|| crate::rnconfig::env("CDP_DEBUG"));
     if let Some(p) = path {
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+        {
             let trimmed: String = msg.chars().take(600).collect();
-            let _ = writeln!(f, "{tag} {trimmed}");
+            // Events put "method" last (after any request "method": "POST"), so it is
+            // often cut off above.
+            let method = msg
+                .rfind("\"method\":\"")
+                .and_then(|i| msg[i + 10..].split('"').next())
+                .unwrap_or("");
+            let _ = writeln!(f, "{tag} [{method}] {trimmed}");
         }
     }
 }
@@ -45,10 +101,17 @@ pub struct DapFrame {
 /// Async debugger notifications pushed to an attached DAP session (one per
 /// connected editor). Separate from `RnEvent`, which drives the TUI.
 pub enum DebugEvent {
-    Paused { frames: Vec<DapFrame>, reason: String, raw_frames: Value },
+    Paused {
+        frames: Vec<DapFrame>,
+        reason: String,
+        raw_frames: Value,
+    },
     Resumed,
     /// A console line / exception, mirrored to the editor's debug console.
-    Output { category: String, output: String },
+    Output {
+        category: String,
+        output: String,
+    },
 }
 
 /// Shared slot holding the attached DAP session's event stream. It lives above
@@ -70,11 +133,10 @@ pub enum Status {
 
 #[derive(Debug, Clone)]
 pub struct LogEntry {
-    pub kind: String,  // console | network | system
     pub level: String, // log | warn | error | info | ...
     pub text: String,
     pub expanded: Option<Vec<String>>, // deep object tree (already fetched), if any
-    pub stack: Option<Vec<String>>,    // call frames ("fn (file:line)"), for exceptions
+    pub stack: Option<Vec<String>>, // call frames ("fn (file:line)"); framework ones start with FRAMEWORK_FRAME
 }
 
 #[derive(Debug, Clone, Default)]
@@ -90,9 +152,9 @@ pub struct NetRecord {
     pub res_body: Option<String>,
     pub start_ts: Option<f64>,
     pub duration_ms: Option<f64>,
-    pub size: Option<i64>,       // bytes over the wire (encodedDataLength)
-    pub failed: Option<String>,  // error text when the request failed
-    pub is_ws: bool,             // a WebSocket connection
+    pub size: Option<i64>,      // bytes over the wire (encodedDataLength)
+    pub failed: Option<String>, // error text when the request failed
+    pub is_ws: bool,            // a WebSocket connection
     pub ws_frames: Vec<(bool, String)>, // (sent?, payload) for WS frames
 }
 
@@ -111,6 +173,7 @@ pub struct PerfSample {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)] // a channel message, moved once
 pub enum RnEvent {
     Targets(Vec<TargetInfo>),
     Status(String, Status),
@@ -118,11 +181,16 @@ pub enum RnEvent {
     Net(String, NetRecord),
     Network(String, bool),
     ContextCleared(String),
+    ContextCreated(String), // a JS context came up (also sent once per connection)
     Perf(String, PerfSample),
     /// The JS VM hit a breakpoint / `debugger;` / step and is now suspended.
     Paused(String, PausedInfo),
     /// Execution resumed (continue or step completed).
     Resumed(String),
+    /// A React DevTools bridge message from the app's backend (event, payload),
+    /// while the Components tab is attached. `signalbox:unavailable` (payload:
+    /// the reason) when the app has no backend to attach to.
+    Devtools(String, String, Value),
 }
 
 /// Where the JS VM stopped, already mapped back to an original source location.
@@ -142,21 +210,38 @@ pub enum ConnCmd {
     StepInto,
     StepOut,
     Pause,
+    /// Become the frontend of the app's React DevTools backend (the
+    /// Components tab), taking over from any other (React Native DevTools).
+    DevtoolsAttach,
+    DevtoolsDetach,
+    /// A React DevTools bridge message to the backend.
+    Devtools {
+        event: String,
+        payload: Value,
+    },
+    /// Run JS in the app, ignoring the result.
+    Eval(String),
     /// Synchronous CDP call on behalf of a DAP session (scopes/variables/eval):
     /// send `method`+`params`, reply with the CDP `result`.
-    DebugRequest { method: String, params: Value, reply: Sender<Value> },
+    DebugRequest {
+        method: String,
+        params: Value,
+        reply: Sender<Value>,
+    },
 }
 
 pub struct RnClient {
     pub rx: Receiver<RnEvent>,
     cmd_senders: Arc<Mutex<HashMap<String, Sender<ConnCmd>>>>,
-    port: u16,
+    /// Why the editor-facing DAP server isn't running, if it isn't.
+    pub dap_error: Option<String>,
 }
 
 impl RnClient {
     pub fn start(port: u16) -> RnClient {
         let (tx, rx) = std::sync::mpsc::channel();
-        let cmd_senders: Arc<Mutex<HashMap<String, Sender<ConnCmd>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let cmd_senders: Arc<Mutex<HashMap<String, Sender<ConnCmd>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let debug_sink: DebugSink = Arc::new(Mutex::new(None));
         let bundle: UrlSlot = Arc::new(Mutex::new(None));
         let senders = cmd_senders.clone();
@@ -164,10 +249,39 @@ impl RnClient {
         let sink = debug_sink.clone();
         let bundle_poll = bundle.clone();
         std::thread::spawn(move || poll_loop(port, evt, senders, sink, bundle_poll));
-        // Expose this metroctl's single Hermes debugger to editors over DAP.
-        let dap_senders = cmd_senders.clone();
-        std::thread::spawn(move || dap::serve(dap_senders, debug_sink, bundle));
-        RnClient { rx, cmd_senders, port }
+        // Expose this signalbox's single Hermes debugger to editors over DAP.
+        let dap_error = match dap::bind() {
+            Ok(listener) => {
+                let dap_senders = cmd_senders.clone();
+                std::thread::spawn(move || dap::serve(listener, dap_senders, debug_sink, bundle));
+                None
+            }
+            Err(e) => Some(e),
+        };
+        RnClient {
+            rx,
+            cmd_senders,
+            dap_error,
+        }
+    }
+
+    /// A client that never connects: no Metro polling, no DAP server.
+    #[cfg(test)]
+    pub fn idle() -> RnClient {
+        RnClient {
+            rx: std::sync::mpsc::channel().1,
+            cmd_senders: Arc::default(),
+            dap_error: None,
+        }
+    }
+
+    /// A client whose commands for `key` land in the returned receiver.
+    #[cfg(test)]
+    pub fn recording(key: &str) -> (RnClient, Receiver<ConnCmd>) {
+        let client = RnClient::idle();
+        let (tx, rx) = std::sync::mpsc::channel();
+        client.cmd_senders.lock().unwrap().insert(key.into(), tx);
+        (client, rx)
     }
 
     pub fn send(&self, key: &str, cmd: ConnCmd) {
@@ -175,17 +289,29 @@ impl RnClient {
             let _ = s.send(cmd);
         }
     }
-
-    pub fn port(&self) -> u16 {
-        self.port
-    }
 }
 
-fn poll_loop(port: u16, tx: Sender<RnEvent>, senders: Arc<Mutex<HashMap<String, Sender<ConnCmd>>>>, debug_sink: DebugSink, bundle: UrlSlot) {
+fn poll_loop(
+    port: u16,
+    tx: Sender<RnEvent>,
+    senders: Arc<Mutex<HashMap<String, Sender<ConnCmd>>>>,
+    debug_sink: DebugSink,
+    bundle: UrlSlot,
+) {
     loop {
         if let Ok(targets) = fetch_targets(port) {
-            let live: Vec<_> = targets.into_iter().filter(|t| t.web_socket_debugger_url.is_some()).collect();
-            let infos: Vec<TargetInfo> = live.iter().map(|t| TargetInfo { key: t.key(), label: t.label(), meta: t.vm.clone() }).collect();
+            let live: Vec<_> = targets
+                .into_iter()
+                .filter(|t| t.web_socket_debugger_url.is_some())
+                .collect();
+            let infos: Vec<TargetInfo> = live
+                .iter()
+                .map(|t| TargetInfo {
+                    key: t.key(),
+                    label: t.label(),
+                    meta: t.vm.clone(),
+                })
+                .collect();
             let _ = tx.send(RnEvent::Targets(infos));
             for t in live {
                 let key = t.key();
@@ -205,11 +331,22 @@ fn poll_loop(port: u16, tx: Sender<RnEvent>, senders: Arc<Mutex<HashMap<String, 
                 }
             }
         }
-        std::thread::sleep(Duration::from_millis(3000));
+        // RN reports network traffic only while a debugger has Network enabled —
+        // nothing is buffered — so every moment before we attach to a freshly
+        // started app is requests lost for good. Poll fast.
+        std::thread::sleep(Duration::from_millis(250));
     }
 }
 
-fn conn_loop(key: &str, url: &str, port: u16, tx: &Sender<RnEvent>, crx: Receiver<ConnCmd>, debug_sink: &DebugSink, bundle: &UrlSlot) {
+fn conn_loop(
+    key: &str,
+    url: &str,
+    port: u16,
+    tx: &Sender<RnEvent>,
+    crx: Receiver<ConnCmd>,
+    debug_sink: &DebugSink,
+    bundle: &UrlSlot,
+) {
     let _ = tx.send(RnEvent::Status(key.into(), Status::Connecting));
     let mut socket = match connect_cdp(url, port) {
         Ok(s) => s,
@@ -224,7 +361,9 @@ fn conn_loop(key: &str, url: &str, port: u16, tx: &Sender<RnEvent>, crx: Receive
     let mut seq = 100i64;
     let mut send = |socket: &mut tungstenite::WebSocket<_>, method: &str| {
         seq += 1;
-        let _ = socket.send(tungstenite::Message::Text(json!({"id": seq, "method": method}).to_string()));
+        let _ = socket.send(tungstenite::Message::Text(
+            json!({"id": seq, "method": method}).to_string(),
+        ));
     };
     send(&mut socket, "Runtime.enable");
     send(&mut socket, "Log.enable");
@@ -233,7 +372,12 @@ fn conn_loop(key: &str, url: &str, port: u16, tx: &Sender<RnEvent>, crx: Receive
     // If Hermes started paused waiting for a debugger, let it run; harmless on an
     // already-running VM.
     send(&mut socket, "Runtime.runIfWaitingForDebugger");
-    cdp_trace("--", &format!("connected {key}: sent Runtime/Log/Network/Debugger.enable + runIfWaitingForDebugger"));
+    cdp_trace(
+        "--",
+        &format!(
+            "connected {key}: sent Runtime/Log/Network/Debugger.enable + runIfWaitingForDebugger"
+        ),
+    );
     let _ = tx.send(RnEvent::Status(key.into(), Status::Connected));
     let _ = tx.send(RnEvent::Network(key.into(), true));
 
@@ -247,6 +391,9 @@ fn conn_loop(key: &str, url: &str, port: u16, tx: &Sender<RnEvent>, crx: Receive
     // sampler's `Runtime.evaluate` — it either queues behind the pause or
     // disturbs it. Set on `Debugger.paused`, cleared on `Debugger.resumed`.
     let mut paused = false;
+    // The Components tab is attached to this app's React DevTools backend.
+    let mut devtools = false;
+    let mut devtools_fix_pending = false; // reloaded: re-install the tap fix
     const FPS_EXPR: &str = "(function(){var s=globalThis.__simonFps;if(!s){s=globalThis.__simonFps={v:0,c:0,t:Date.now()};var loop=function(){s.c++;var n=Date.now();if(n-s.t>=1000){s.v=Math.round(s.c*1000/(n-s.t));s.c=0;s.t=n;}(globalThis.requestAnimationFrame||function(f){return setTimeout(f,16);})(loop);};loop();}return s.v;})()";
 
     loop {
@@ -256,13 +403,37 @@ fn conn_loop(key: &str, url: &str, port: u16, tx: &Sender<RnEvent>, crx: Receive
             seq += 1;
             let rid = seq;
             let _ = socket.send(tungstenite::Message::Text(json!({"id": rid, "method": "Runtime.evaluate", "params": {"expression": FPS_EXPR, "returnByValue": true}}).to_string()));
-            if let Some(r) = request_response(&mut socket, rid, key, tx, &mut records, &mut seq, port, &mut paused, &mut scripts, debug_sink) {
+            if let Some(r) = request_response(
+                &mut socket,
+                rid,
+                key,
+                tx,
+                &mut records,
+                &mut seq,
+                port,
+                &mut paused,
+                &mut scripts,
+                debug_sink,
+            ) {
                 sample.fps = r["result"]["value"].as_i64();
             }
             seq += 1;
             let rid = seq;
-            let _ = socket.send(tungstenite::Message::Text(json!({"id": rid, "method": "Runtime.getHeapUsage"}).to_string()));
-            if let Some(r) = request_response(&mut socket, rid, key, tx, &mut records, &mut seq, port, &mut paused, &mut scripts, debug_sink) {
+            let _ = socket.send(tungstenite::Message::Text(
+                json!({"id": rid, "method": "Runtime.getHeapUsage"}).to_string(),
+            ));
+            if let Some(r) = request_response(
+                &mut socket,
+                rid,
+                key,
+                tx,
+                &mut records,
+                &mut seq,
+                port,
+                &mut paused,
+                &mut scripts,
+                debug_sink,
+            ) {
                 sample.heap_used = r["usedSize"].as_i64();
                 sample.heap_total = r["totalSize"].as_i64();
             }
@@ -272,37 +443,146 @@ fn conn_loop(key: &str, url: &str, port: u16, tx: &Sender<RnEvent>, crx: Receive
         while let Ok(cmd) = crx.try_recv() {
             match cmd {
                 ConnCmd::Reload => {
-                    let _ = socket.send(tungstenite::Message::Text(json!({"id": 1, "method": "Page.reload"}).to_string()));
-                    let _ = socket.send(tungstenite::Message::Text(json!({"id": 2, "method": "ReactNativeApplication.reload"}).to_string()));
+                    let _ = socket.send(tungstenite::Message::Text(
+                        json!({"id": 1, "method": "Page.reload"}).to_string(),
+                    ));
+                    let _ = socket.send(tungstenite::Message::Text(
+                        json!({"id": 2, "method": "ReactNativeApplication.reload"}).to_string(),
+                    ));
                 }
                 ConnCmd::DiscardConsole => {
                     records.clear();
-                    let _ = socket.send(tungstenite::Message::Text(json!({"id": 3, "method": "Runtime.discardConsoleEntries"}).to_string()));
-                    let _ = socket.send(tungstenite::Message::Text(json!({"id": 4, "method": "Log.clear"}).to_string()));
+                    let _ = socket.send(tungstenite::Message::Text(
+                        json!({"id": 3, "method": "Runtime.discardConsoleEntries"}).to_string(),
+                    ));
+                    let _ = socket.send(tungstenite::Message::Text(
+                        json!({"id": 4, "method": "Log.clear"}).to_string(),
+                    ));
                 }
                 ConnCmd::Continue => debug_cmd(&mut socket, &mut seq, "Debugger.resume"),
                 ConnCmd::StepOver => debug_cmd(&mut socket, &mut seq, "Debugger.stepOver"),
                 ConnCmd::StepInto => debug_cmd(&mut socket, &mut seq, "Debugger.stepInto"),
                 ConnCmd::StepOut => debug_cmd(&mut socket, &mut seq, "Debugger.stepOut"),
                 ConnCmd::Pause => debug_cmd(&mut socket, &mut seq, "Debugger.pause"),
-                ConnCmd::DebugRequest { method, params, reply } => {
+                ConnCmd::DevtoolsAttach => {
+                    devtools = true;
+                    cdp_send(
+                        &mut socket,
+                        &mut seq,
+                        "Runtime.addBinding",
+                        json!({ "name": DEVTOOLS_BINDING }),
+                    );
+                    seq += 1;
+                    let rid = seq;
+                    let _ = socket.send(tungstenite::Message::Text(
+                        json!({"id": rid, "method": "Runtime.evaluate", "params": {
+                            "expression": DEVTOOLS_INIT_JS, "returnByValue": true}})
+                        .to_string(),
+                    ));
+                    let res = request_response(
+                        &mut socket,
+                        rid,
+                        key,
+                        tx,
+                        &mut records,
+                        &mut seq,
+                        port,
+                        &mut paused,
+                        &mut scripts,
+                        debug_sink,
+                    );
+                    let why = match res.as_ref().map(|r| &r["result"]["value"]) {
+                        Some(v) if v == "ok" => None,
+                        Some(v) if v == "missing" => Some("this app has no React DevTools backend (needs React Native 0.76+ in a dev build)"),
+                        _ => Some("couldn't reach the app's React DevTools backend"),
+                    };
+                    // After connecting: the fix also points React Native's
+                    // overlay at the agent this connection created.
+                    evaluate(&mut socket, &mut seq, &devtools_scripts());
+                    if let Some(why) = why {
+                        let _ = tx.send(RnEvent::Devtools(
+                            key.into(),
+                            "signalbox:unavailable".into(),
+                            json!(why),
+                        ));
+                    }
+                }
+                ConnCmd::Eval(expr) => evaluate(&mut socket, &mut seq, &expr),
+                ConnCmd::DevtoolsDetach => {
+                    devtools = false;
+                    cdp_send(
+                        &mut socket,
+                        &mut seq,
+                        "Runtime.removeBinding",
+                        json!({ "name": DEVTOOLS_BINDING }),
+                    );
+                }
+                ConnCmd::Devtools { event, payload } => {
+                    let message = json!({ "event": event, "payload": payload }).to_string();
+                    let expr = format!(
+                        "__FUSEBOX_REACT_DEVTOOLS_DISPATCHER__.sendMessage('react-devtools', {})",
+                        serde_json::to_string(&message).unwrap_or_default()
+                    );
+                    evaluate(&mut socket, &mut seq, &expr);
+                }
+                ConnCmd::DebugRequest {
+                    method,
+                    params,
+                    reply,
+                } => {
                     seq += 1;
                     let rid = seq;
                     cdp_trace(">>", &method);
                     let _ = socket.send(tungstenite::Message::Text(
                         json!({"id": rid, "method": method, "params": params}).to_string(),
                     ));
-                    let result = request_response(&mut socket, rid, key, tx, &mut records, &mut seq, port, &mut paused, &mut scripts, debug_sink)
-                        .unwrap_or(Value::Null);
+                    let result = request_response(
+                        &mut socket,
+                        rid,
+                        key,
+                        tx,
+                        &mut records,
+                        &mut seq,
+                        port,
+                        &mut paused,
+                        &mut scripts,
+                        debug_sink,
+                    )
+                    .unwrap_or(Value::Null);
                     let _ = reply.send(result);
                 }
             }
         }
-        match socket.read() {
+        match next_frame(&mut socket) {
             Ok(tungstenite::Message::Text(t)) => {
                 cdp_trace("<<", &t);
                 if let Ok(v) = serde_json::from_str::<Value>(&t) {
-                    handle_message(key, &v, tx, &mut records, &mut socket, &mut seq, port, &mut paused, &mut scripts, debug_sink);
+                    handle_message(
+                        key,
+                        &v,
+                        tx,
+                        &mut records,
+                        &mut socket,
+                        &mut seq,
+                        port,
+                        &mut paused,
+                        &mut scripts,
+                        debug_sink,
+                    );
+                }
+                // A reload: the backend reconnects by itself (the binding
+                // survives), but the tap fix lived in the old JS context. The
+                // new context has no app code yet, so install the fix once the
+                // backend sends its first tree.
+                if devtools && t.contains("\"Runtime.executionContextCreated\"") {
+                    devtools_fix_pending = true;
+                }
+                if devtools_fix_pending
+                    && t.contains("\"Runtime.bindingCalled\"")
+                    && t.contains("operations")
+                {
+                    devtools_fix_pending = false;
+                    evaluate(&mut socket, &mut seq, &devtools_scripts());
                 }
                 // Surface the app's main bundle URL for the DAP source-map fetch.
                 if bundle.lock().unwrap().is_none() {
@@ -313,18 +593,54 @@ fn conn_loop(key: &str, url: &str, port: u16, tx: &Sender<RnEvent>, crx: Receive
             }
             Ok(tungstenite::Message::Close(_)) => break,
             Ok(_) => {}
-            Err(tungstenite::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(tungstenite::Error::Io(e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
             Err(_) => break,
         }
     }
     let _ = tx.send(RnEvent::Status(key.into(), Status::Disconnected));
 }
 
-/// Send a parameterless Debugger command, allocating a fresh request id.
-fn debug_cmd(socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>, seq: &mut i64, method: &str) {
+/// Send a CDP command without waiting for its reply.
+fn cdp_send(
+    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+    seq: &mut i64,
+    method: &str,
+    params: Value,
+) {
     *seq += 1;
     cdp_trace(">>", method);
-    let _ = socket.send(tungstenite::Message::Text(json!({"id": *seq, "method": method}).to_string()));
+    let _ = socket.send(tungstenite::Message::Text(
+        json!({"id": *seq, "method": method, "params": params}).to_string(),
+    ));
+}
+
+/// Run JS in the app without waiting for the result.
+fn evaluate(
+    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+    seq: &mut i64,
+    expression: &str,
+) {
+    cdp_send(
+        socket,
+        seq,
+        "Runtime.evaluate",
+        json!({ "expression": expression }),
+    );
+}
+
+/// Send a parameterless Debugger command, allocating a fresh request id.
+fn debug_cmd(
+    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+    seq: &mut i64,
+    method: &str,
+) {
+    *seq += 1;
+    cdp_trace(">>", method);
+    let _ = socket.send(tungstenite::Message::Text(
+        json!({"id": *seq, "method": method}).to_string(),
+    ));
 }
 
 /// Learn scriptId → URL from a CDP stackTrace (console/exception frames carry
@@ -334,7 +650,9 @@ fn learn_scripts(scripts: &mut HashMap<String, String>, st: &Value) {
         for f in frames {
             if let (Some(sid), Some(url)) = (f["scriptId"].as_str(), f["url"].as_str()) {
                 if !url.is_empty() {
-                    scripts.entry(sid.to_string()).or_insert_with(|| url.to_string());
+                    scripts
+                        .entry(sid.to_string())
+                        .or_insert_with(|| url.to_string());
                 }
             }
         }
@@ -360,23 +678,28 @@ fn request_response(
     debug_sink: &DebugSink,
 ) -> Option<Value> {
     for _ in 0..50 {
-        match socket.read() {
+        match next_frame(socket) {
             Ok(tungstenite::Message::Text(t)) => {
                 cdp_trace("<<", &t);
                 if let Ok(v) = serde_json::from_str::<Value>(&t) {
                     if v.get("id").and_then(|i| i.as_i64()) == Some(id) {
                         return v.get("result").cloned();
                     }
-                    handle_message(key, &v, tx, records, socket, seq, port, paused, scripts, debug_sink);
+                    handle_message(
+                        key, &v, tx, records, socket, seq, port, paused, scripts, debug_sink,
+                    );
                 }
             }
-            Err(tungstenite::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(tungstenite::Error::Io(e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
             _ => return None,
         }
     }
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_message(
     key: &str,
     msg: &Value,
@@ -393,11 +716,27 @@ fn handle_message(
     match method {
         "Debugger.paused" => {
             *paused = true;
-            let frames = msg["params"]["callFrames"].as_array().cloned().unwrap_or_default();
-            let reason = msg["params"]["reason"].as_str().unwrap_or("breakpoint").to_string();
+            let frames = msg["params"]["callFrames"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let reason = msg["params"]["reason"]
+                .as_str()
+                .unwrap_or("breakpoint")
+                .to_string();
             let dap_frames = symbolicate_frames(port, &frames, scripts);
-            let (file, line) = dap_frames.first().map(|f| (f.file.clone(), f.line)).unwrap_or_default();
-            let _ = tx.send(RnEvent::Paused(key.into(), PausedInfo { file, line, reason: reason.clone() }));
+            let (file, line) = dap_frames
+                .first()
+                .map(|f| (f.file.clone(), f.line))
+                .unwrap_or_default();
+            let _ = tx.send(RnEvent::Paused(
+                key.into(),
+                PausedInfo {
+                    file,
+                    line,
+                    reason: reason.clone(),
+                },
+            ));
             if let Some(de) = debug_sink.lock().unwrap().as_ref() {
                 let _ = de.send(DebugEvent::Paused {
                     frames: dap_frames,
@@ -417,7 +756,9 @@ fn handle_message(
             let p = &msg["params"];
             if let (Some(sid), Some(url)) = (p["scriptId"].as_str(), p["url"].as_str()) {
                 if !url.is_empty() {
-                    scripts.entry(sid.to_string()).or_insert_with(|| url.to_string());
+                    scripts
+                        .entry(sid.to_string())
+                        .or_insert_with(|| url.to_string());
                 }
             }
         }
@@ -429,8 +770,15 @@ fn handle_message(
             let text = args.iter().map(render_arg).collect::<Vec<_>>().join(" ");
             // Mirror to the editor's debug console (before `text`/`level` move).
             if let Some(de) = debug_sink.lock().unwrap().as_ref() {
-                let category = if level == "error" || level == "assert" { "stderr" } else { "stdout" };
-                let _ = de.send(DebugEvent::Output { category: category.into(), output: format!("{text}\n") });
+                let category = if level == "error" || level == "assert" {
+                    "stderr"
+                } else {
+                    "stdout"
+                };
+                let _ = de.send(DebugEvent::Output {
+                    category: category.into(),
+                    output: format!("{text}\n"),
+                });
             }
             // Eagerly expand the first object arg into a JS tree via getProperties.
             let mut expanded = None;
@@ -445,30 +793,83 @@ fn handle_message(
                 }
             }
             let stack = stack_frames(&p["stackTrace"], port);
-            let _ = tx.send(RnEvent::Log(key.into(), LogEntry { kind: "console".into(), level, text, expanded, stack }));
+            let _ = tx.send(RnEvent::Log(
+                key.into(),
+                LogEntry {
+                    level,
+                    text,
+                    expanded,
+                    stack,
+                },
+            ));
         }
         "Log.entryAdded" => {
             let e = &msg["params"]["entry"];
             let _ = tx.send(RnEvent::Log(
                 key.into(),
-                LogEntry { kind: "console".into(), level: e["level"].as_str().unwrap_or("log").into(), text: e["text"].as_str().unwrap_or("").into(), expanded: None, stack: stack_frames(&e["stackTrace"], port) },
+                LogEntry {
+                    level: e["level"].as_str().unwrap_or("log").into(),
+                    text: e["text"].as_str().unwrap_or("").into(),
+                    expanded: None,
+                    stack: stack_frames(&e["stackTrace"], port),
+                },
             ));
         }
         "Runtime.exceptionThrown" => {
             let d = &msg["params"]["exceptionDetails"];
             learn_scripts(scripts, &d["stackTrace"]);
-            let text = d["exception"]["description"].as_str().or_else(|| d["text"].as_str()).unwrap_or("Uncaught exception").to_string();
+            let text = d["exception"]["description"]
+                .as_str()
+                .or_else(|| d["text"].as_str())
+                .unwrap_or("Uncaught exception")
+                .to_string();
             if let Some(de) = debug_sink.lock().unwrap().as_ref() {
-                let _ = de.send(DebugEvent::Output { category: "stderr".into(), output: format!("{text}\n") });
+                let _ = de.send(DebugEvent::Output {
+                    category: "stderr".into(),
+                    output: format!("{text}\n"),
+                });
             }
             let stack = stack_frames(&d["stackTrace"], port);
-            let _ = tx.send(RnEvent::Log(key.into(), LogEntry { kind: "console".into(), level: "error".into(), text, expanded: None, stack }));
+            let _ = tx.send(RnEvent::Log(
+                key.into(),
+                LogEntry {
+                    level: "error".into(),
+                    text,
+                    expanded: None,
+                    stack,
+                },
+            ));
+        }
+        "Runtime.bindingCalled" if msg["params"]["name"] == DEVTOOLS_BINDING => {
+            let Some(mut wrapped) = msg["params"]["payload"]
+                .as_str()
+                .and_then(|p| serde_json::from_str::<Value>(p).ok())
+            else {
+                return;
+            };
+            if wrapped["domain"] != "react-devtools" {
+                return;
+            }
+            let event = wrapped["message"]["event"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let mut payload = wrapped["message"]["payload"].take();
+            if event == "inspectedElement" {
+                symbolicate_source(port, &mut payload["value"]);
+            }
+            let _ = tx.send(RnEvent::Devtools(key.into(), event, payload));
         }
         "Runtime.executionContextsCleared" => {
             records.clear();
             let _ = tx.send(RnEvent::ContextCleared(key.into()));
         }
-        m if m.starts_with("Network.") => handle_network(key, m, &msg["params"], tx, records, socket, seq),
+        "Runtime.executionContextCreated" => {
+            let _ = tx.send(RnEvent::ContextCreated(key.into()));
+        }
+        m if m.starts_with("Network.") => {
+            handle_network(key, m, &msg["params"], tx, records, socket, seq)
+        }
         _ => {}
     }
 }
@@ -535,13 +936,25 @@ fn handle_network(
                 if let (Some(start), Some(end)) = (rec.start_ts, p["timestamp"].as_f64()) {
                     rec.duration_ms = Some(((end - start) * 1000.0).max(0.0));
                 }
-                rec.failed = Some(p["errorText"].as_str().unwrap_or("request failed").to_string());
+                rec.failed = Some(
+                    p["errorText"]
+                        .as_str()
+                        .unwrap_or("request failed")
+                        .to_string(),
+                );
                 let _ = tx.send(RnEvent::Net(key.into(), rec.clone()));
             }
         }
         // WebSocket traffic (GraphQL subscriptions, live sockets).
         "Network.webSocketCreated" => {
-            let rec = NetRecord { id: id.clone(), method: "WS".into(), url: p["url"].as_str().unwrap_or("").into(), is_ws: true, start_ts: p["timestamp"].as_f64(), ..Default::default() };
+            let rec = NetRecord {
+                id: id.clone(),
+                method: "WS".into(),
+                url: p["url"].as_str().unwrap_or("").into(),
+                is_ws: true,
+                start_ts: p["timestamp"].as_f64(),
+                ..Default::default()
+            };
             records.insert(id.clone(), rec.clone());
             let _ = tx.send(RnEvent::Net(key.into(), rec));
         }
@@ -551,7 +964,10 @@ fn handle_network(
                 let fr = &p["response"];
                 let payload = match fr["opcode"].as_i64() {
                     Some(1) | None => fr["payloadData"].as_str().unwrap_or("").to_string(),
-                    Some(2) => format!("[binary {} bytes]", fr["payloadData"].as_str().map(|s| s.len()).unwrap_or(0)),
+                    Some(2) => format!(
+                        "[binary {} bytes]",
+                        fr["payloadData"].as_str().map(|s| s.len()).unwrap_or(0)
+                    ),
                     Some(op) => format!("[opcode {op}]"),
                 };
                 rec.ws_frames.push((sent, payload));
@@ -562,24 +978,21 @@ fn handle_network(
     }
 }
 
+/// Prefix marking a frame Metro's symbolicator collapses (React/RN internals),
+/// so the view can hide or show them.
+pub const FRAMEWORK_FRAME: &str = "  · ";
+
 /// Flatten a CDP stackTrace into `function (url:line)` strings.
 /// Keep only the last few path segments so frames read like `src/utils/log.ts`.
-fn shorten_path(p: &str) -> String {
-    let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
-    if parts.len() > 3 {
-        parts[parts.len() - 3..].join("/")
-    } else {
-        p.to_string()
-    }
-}
-
 fn frame_line(name: &str, file: &str, line: i64) -> String {
     let name = if name.is_empty() { "<anonymous>" } else { name };
-    format!("  at {name} ({}:{line})", shorten_path(file))
+    // Keep the FULL path so `o` (open in nvim) resolves it — a shortened display
+    // (last few segments) breaks files under node_modules/….
+    format!("  at {name} ({file}:{line})")
 }
 
 /// Turn a CDP stackTrace into readable lines. Tries Metro's `/symbolicate` to map
-/// bundle positions back to source files (dropping collapsed framework frames);
+/// bundle positions back to source files (marking collapsed framework frames);
 /// falls back to the raw bundle positions if symbolication isn't available.
 fn stack_frames(st: &Value, port: u16) -> Option<Vec<String>> {
     let frames = st.get("callFrames")?.as_array()?;
@@ -609,13 +1022,17 @@ fn stack_frames(st: &Value, port: u16) -> Option<Vec<String>> {
 /// mapped frames (each with `methodName`/`file`/`lineNumber`/`collapse`).
 fn post_symbolicate(port: u16, stack: Vec<Value>) -> Option<Vec<Value>> {
     let url = format!("http://localhost:{port}/symbolicate");
-    let resp = reqwest::blocking::Client::new().post(&url).json(&json!({ "stack": stack })).send().ok()?;
+    let resp = reqwest::blocking::Client::new()
+        .post(&url)
+        .json(&json!({ "stack": stack }))
+        .send()
+        .ok()?;
     let body: Value = resp.json().ok()?;
     body.get("stack")?.as_array().cloned()
 }
 
 /// Symbolicate a Runtime stackTrace (line/col top-level) into readable frame
-/// lines, dropping collapsed framework frames. CDP positions are 0-based; Metro
+/// lines, marking collapsed framework frames. CDP positions are 0-based; Metro
 /// wants a 1-based line.
 fn symbolicate(port: u16, frames: &[Value]) -> Option<Vec<String>> {
     let req: Vec<Value> = frames
@@ -632,12 +1049,16 @@ fn symbolicate(port: u16, frames: &[Value]) -> Option<Vec<String>> {
     let mapped = post_symbolicate(port, req)?;
     let out: Vec<String> = mapped
         .iter()
-        .filter(|f| f.get("collapse").and_then(|c| c.as_bool()) != Some(true)) // drop framework frames
         .map(|f| {
             let name = f["methodName"].as_str().unwrap_or("");
             let file = f["file"].as_str().unwrap_or("");
             let line = f["lineNumber"].as_i64().unwrap_or(0);
-            frame_line(name, file, line)
+            let l = frame_line(name, file, line);
+            if f.get("collapse").and_then(|c| c.as_bool()) == Some(true) {
+                format!("{FRAMEWORK_FRAME}{}", l.trim_start())
+            } else {
+                l
+            }
         })
         .collect();
     if out.is_empty() {
@@ -645,6 +1066,76 @@ fn symbolicate(port: u16, frames: &[Value]) -> Option<Vec<String>> {
     } else {
         Some(out)
     }
+}
+
+/// Where an inspected component is defined (`signalboxSource`) and used
+/// (`signalboxUsage`, the JSX line that created it, from the element's stack
+/// the injected script adds as `signalboxStack`), mapped from the bundle back
+/// to source files ("file:line"). One request to Metro for both.
+fn symbolicate_source(port: u16, value: &mut Value) {
+    let mut frames = Vec::new();
+    let s = &value["source"];
+    let has_source = if let (Some(url), Some(line)) = (s["sourceURL"].as_str(), s["line"].as_i64())
+    {
+        frames.push(json!({
+            "file": url,
+            "lineNumber": line,
+            "column": s["column"].as_i64().unwrap_or(0),
+            "methodName": "",
+        }));
+        true
+    } else {
+        false
+    };
+    if let Some(stack) = value["signalboxStack"].as_str() {
+        frames.extend(stack_text_frames(stack).into_iter().take(12).map(|(url, line, column)| {
+            json!({"file": url, "lineNumber": line, "column": column, "methodName": ""})
+        }));
+    }
+    if frames.is_empty() {
+        return;
+    }
+    let Some(mapped) = post_symbolicate(port, frames) else {
+        return;
+    };
+    let location = |f: &Value| -> Option<String> {
+        let file = f["file"].as_str()?;
+        let line = f["lineNumber"].as_i64()?;
+        (!file.is_empty() && !file.contains(".bundle")).then(|| format!("{file}:{line}"))
+    };
+    let mut rest = mapped.iter();
+    if has_source {
+        if let Some(l) = rest.next().and_then(location) {
+            value["signalboxSource"] = json!(l);
+        }
+    }
+    // The first frame outside React and libraries: the parent's JSX.
+    if let Some(l) = rest
+        .filter(|f| !f["file"].as_str().unwrap_or("").contains("/node_modules/"))
+        .find_map(location)
+    {
+        value["signalboxUsage"] = json!(l);
+    }
+}
+
+/// Bundle positions in a JS `Error.stack` text: `(url, line, column)` from
+/// lines like `    at name (http://…bundle…:12:34)`.
+fn stack_text_frames(stack: &str) -> Vec<(String, i64, i64)> {
+    stack
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim().strip_prefix("at ")?;
+            let loc = match l.rfind('(') {
+                Some(i) => l[i + 1..].trim_end_matches(')'),
+                None => l,
+            };
+            let loc = loc.strip_prefix("address at ").unwrap_or(loc);
+            let (rest, column) = loc.rsplit_once(':')?;
+            let (url, line) = rest.rsplit_once(':')?;
+            Some((url.to_string(), line.parse().ok()?, column.parse().ok()?))
+        })
+        .filter(|(url, _, _)| url.starts_with("http"))
+        .collect()
 }
 
 /// Map a `Debugger.paused` callFrame list to the top original `(file, line)`.
@@ -655,7 +1146,11 @@ fn symbolicate(port: u16, frames: &[Value]) -> Option<Vec<String>> {
 /// source locations). Debugger frames carry only a scriptId, so the URL is
 /// resolved from the learned `scripts` map. Falls back to raw bundle positions
 /// per frame when the symbolicator can't map them.
-fn symbolicate_frames(port: u16, frames: &[Value], scripts: &HashMap<String, String>) -> Vec<DapFrame> {
+fn symbolicate_frames(
+    port: u16,
+    frames: &[Value],
+    scripts: &HashMap<String, String>,
+) -> Vec<DapFrame> {
     let frame_url = |f: &Value| -> String {
         let sid = f["location"]["scriptId"].as_str().unwrap_or("");
         scripts
@@ -665,7 +1160,13 @@ fn symbolicate_frames(port: u16, frames: &[Value], scripts: &HashMap<String, Str
             .unwrap_or("")
             .to_string()
     };
-    let name_of = |n: &str| if n.is_empty() { "<anonymous>".to_string() } else { n.to_string() };
+    let name_of = |n: &str| {
+        if n.is_empty() {
+            "<anonymous>".to_string()
+        } else {
+            n.to_string()
+        }
+    };
 
     // Per-frame raw fallback (bundle basename + 1-based line/col).
     let raw: Vec<DapFrame> = frames
@@ -715,7 +1216,10 @@ fn symbolicate_frames(port: u16, frames: &[Value], scripts: &HashMap<String, Str
 }
 
 /// Read frames until the response with `id` arrives (bounded), returning its `result`.
-fn await_result(socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>, id: i64) -> Option<Value> {
+fn await_result(
+    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+    id: i64,
+) -> Option<Value> {
     for _ in 0..50 {
         match socket.read() {
             Ok(tungstenite::Message::Text(t)) => {
@@ -724,11 +1228,12 @@ fn await_result(socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTl
                         return v.get("result").cloned();
                     }
                 }
-                // Non-matching frame read mid-request is silently discarded here —
-                // trace it so we can see if a Debugger.paused gets eaten.
-                cdp_trace("DROP", &t);
+                // Some other event arrived mid-request; keep it for the read loop.
+                BACKLOG.with(|b| b.borrow_mut().push_back(t));
             }
-            Err(tungstenite::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(tungstenite::Error::Io(e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
             _ => return None,
         }
     }
@@ -736,12 +1241,34 @@ fn await_result(socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTl
 }
 
 /// Deep-expand an object via Runtime.getProperties into pretty JS lines.
-fn get_object_tree(socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>, seq: &mut i64, object_id: &str, depth: i32) -> Option<Vec<String>> {
-    let val = build_value(socket, seq, object_id, depth)?;
+/// Most `Runtime.getProperties` round trips one console entry may spend. Each is
+/// a blocking trip to the device, and an app that logs whole API responses would
+/// otherwise stall this connection (and every network event behind it) for
+/// seconds per log line. Objects past the budget print as `{…}`.
+const EXPAND_BUDGET: usize = 25;
+
+fn get_object_tree(
+    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+    seq: &mut i64,
+    object_id: &str,
+    depth: i32,
+) -> Option<Vec<String>> {
+    let mut budget = EXPAND_BUDGET;
+    let val = build_value(socket, seq, object_id, depth, &mut budget)?;
     Some(format_js(&val, "").lines().map(String::from).collect())
 }
 
-fn build_value(socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>, seq: &mut i64, object_id: &str, depth: i32) -> Option<Value> {
+fn build_value(
+    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+    seq: &mut i64,
+    object_id: &str,
+    depth: i32,
+    budget: &mut usize,
+) -> Option<Value> {
+    if *budget == 0 {
+        return None;
+    }
+    *budget -= 1;
     *seq += 1;
     let req_id = *seq;
     let _ = socket.send(tungstenite::Message::Text(json!({"id": req_id, "method": "Runtime.getProperties", "params": {"objectId": object_id, "ownProperties": true}}).to_string()));
@@ -767,15 +1294,26 @@ fn build_value(socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTls
             continue;
         }
         let v = &p["value"];
-        let child = if v["type"].as_str() == Some("object") && v.get("objectId").is_some() && depth > 0 {
-            build_value(socket, seq, v["objectId"].as_str().unwrap(), depth - 1).unwrap_or(Value::String("{…}".into()))
-        } else {
-            primitive(v)
-        };
+        let child =
+            if v["type"].as_str() == Some("object") && v.get("objectId").is_some() && depth > 0 {
+                build_value(
+                    socket,
+                    seq,
+                    v["objectId"].as_str().unwrap(),
+                    depth - 1,
+                    budget,
+                )
+                .unwrap_or(Value::String("{…}".into()))
+            } else {
+                primitive(v)
+            };
         map.insert(name, child);
     }
     if is_array && !map.is_empty() {
-        let mut items: Vec<(usize, Value)> = map.into_iter().filter_map(|(k, v)| k.parse::<usize>().ok().map(|i| (i, v))).collect();
+        let mut items: Vec<(usize, Value)> = map
+            .into_iter()
+            .filter_map(|(k, v)| k.parse::<usize>().ok().map(|i| (i, v)))
+            .collect();
         items.sort_by_key(|(i, _)| *i);
         Some(Value::Array(items.into_iter().map(|(_, v)| v).collect()))
     } else {
@@ -806,12 +1344,18 @@ pub fn format_js(value: &Value, indent: &str) -> String {
         Value::String(s) => format!("{s:?}"),
         Value::Array(a) if a.is_empty() => "[]".into(),
         Value::Array(a) => {
-            let items: Vec<String> = a.iter().map(|v| format!("{next}{}", format_js(v, &next))).collect();
+            let items: Vec<String> = a
+                .iter()
+                .map(|v| format!("{next}{}", format_js(v, &next)))
+                .collect();
             format!("[\n{}\n{indent}]", items.join(",\n"))
         }
         Value::Object(o) if o.is_empty() => "{}".into(),
         Value::Object(o) => {
-            let items: Vec<String> = o.iter().map(|(k, v)| format!("{next}{}: {}", k, format_js(v, &next))).collect();
+            let items: Vec<String> = o
+                .iter()
+                .map(|(k, v)| format!("{next}{}: {}", k, format_js(v, &next)))
+                .collect();
             format!("{{\n{}\n{indent}}}", items.join(",\n"))
         }
     }
@@ -842,7 +1386,10 @@ fn preview_to_string(p: &Value) -> String {
             let val = if pr.get("valuePreview").is_some() {
                 preview_to_string(&pr["valuePreview"])
             } else {
-                pr["value"].as_str().map(String::from).unwrap_or_else(|| pr["type"].as_str().unwrap_or("").to_string())
+                pr["value"]
+                    .as_str()
+                    .map(String::from)
+                    .unwrap_or_else(|| pr["type"].as_str().unwrap_or("").to_string())
             };
             if subtype_array {
                 val
@@ -860,7 +1407,11 @@ fn preview_to_string(p: &Value) -> String {
 
 fn headers(v: &Value) -> Vec<(String, String)> {
     v.as_object()
-        .map(|o| o.iter().map(|(k, val)| (k.clone(), val.as_str().unwrap_or("").to_string())).collect())
+        .map(|o| {
+            o.iter()
+                .map(|(k, val)| (k.clone(), val.as_str().unwrap_or("").to_string()))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -887,5 +1438,545 @@ mod base64_lite {
             }
         }
         String::from_utf8_lossy(&out).into_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fake_metro::{reply, FakeMetro};
+    use std::time::Instant;
+
+    /// A `conn_loop` against `metro`'s target "page", as `poll_loop` starts it.
+    struct Conn {
+        rx: Receiver<RnEvent>,
+        cmd: Sender<ConnCmd>,
+        bundle: UrlSlot,
+    }
+
+    fn connect(metro: &FakeMetro) -> Conn {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (cmd, crx) = std::sync::mpsc::channel();
+        let sink: DebugSink = Arc::new(Mutex::new(None));
+        let bundle: UrlSlot = Arc::new(Mutex::new(None));
+        let (url, port, b) = (metro.ws_url("page"), metro.port, bundle.clone());
+        std::thread::spawn(move || conn_loop("page", &url, port, &tx, crx, &sink, &b));
+        metro.wait_connected();
+        Conn { rx, cmd, bundle }
+    }
+
+    /// The first event `pick` accepts within a few seconds; earlier ones are skipped.
+    fn wait_for<T>(rx: &Receiver<RnEvent>, mut pick: impl FnMut(RnEvent) -> Option<T>) -> T {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            if let Ok(ev) = rx.recv_timeout(left) {
+                if let Some(v) = pick(ev) {
+                    return v;
+                }
+            }
+        }
+        panic!("event not received");
+    }
+
+    fn log_text(rx: &Receiver<RnEvent>, text: &str) -> LogEntry {
+        wait_for(rx, |e| match e {
+            RnEvent::Log(_, l) if l.text == text => Some(l),
+            _ => None,
+        })
+    }
+
+    fn console(text: &str) -> Value {
+        json!({"method": "Runtime.consoleAPICalled", "params": {
+            "type": "log", "args": [{"type": "string", "value": text}]}})
+    }
+
+    #[test]
+    fn enables_the_domains_on_connect() {
+        let metro = FakeMetro::start();
+        let c = connect(&metro);
+        wait_for(&c.rx, |e| {
+            matches!(e, RnEvent::Status(_, Status::Connected)).then_some(())
+        });
+        for m in [
+            "Runtime.enable",
+            "Log.enable",
+            "Network.enable",
+            "Debugger.enable",
+            "Runtime.runIfWaitingForDebugger",
+        ] {
+            assert_eq!(metro.requests(m).len(), 1, "{m}");
+        }
+    }
+
+    #[test]
+    fn reports_disconnect_when_metro_closes_the_socket() {
+        let metro = FakeMetro::start();
+        let c = connect(&metro);
+        metro.close_all();
+        wait_for(&c.rx, |e| {
+            matches!(e, RnEvent::Status(_, Status::Disconnected)).then_some(())
+        });
+    }
+
+    #[test]
+    fn follows_a_request_through_to_its_body() {
+        // The body reply comes after an unrelated console event, which must
+        // still reach the UI (it used to be dropped while awaiting the reply).
+        let metro = FakeMetro::with(|req| match req["method"].as_str() {
+            Some("Network.getResponseBody") => vec![
+                console("meanwhile"),
+                reply(req, json!({"body": "aGVsbG8=", "base64Encoded": true})),
+            ],
+            _ => vec![reply(req, json!({}))],
+        });
+        let c = connect(&metro);
+        metro.send(json!({"method": "Network.requestWillBeSent", "params": {
+            "requestId": "r1", "timestamp": 10.0,
+            "request": {"method": "POST", "url": "https://api.test/login",
+                        "headers": {"Accept": "json"}, "postData": "{}"}}}));
+        metro.send(json!({"method": "Network.responseReceived", "params": {
+            "requestId": "r1",
+            "response": {"status": 201, "mimeType": "application/json", "headers": {"X": "1"}}}}));
+        metro.send(json!({"method": "Network.loadingFinished", "params": {
+            "requestId": "r1", "timestamp": 10.25, "encodedDataLength": 5}}));
+
+        let rec = wait_for(&c.rx, |e| match e {
+            RnEvent::Net(_, r) if r.res_body.is_some() => Some(r),
+            _ => None,
+        });
+        assert_eq!(rec.method, "POST");
+        assert_eq!(rec.url, "https://api.test/login");
+        assert_eq!(rec.req_headers, vec![("Accept".into(), "json".into())]);
+        assert_eq!(rec.req_body.as_deref(), Some("{}"));
+        assert_eq!(rec.status, Some(201));
+        assert_eq!(rec.mime_type.as_deref(), Some("application/json"));
+        assert_eq!(rec.res_body.as_deref(), Some("hello"));
+        assert_eq!(rec.size, Some(5));
+        assert_eq!(rec.duration_ms, Some(250.0));
+        log_text(&c.rx, "meanwhile");
+    }
+
+    #[test]
+    fn marks_failed_requests() {
+        let metro = FakeMetro::start();
+        let c = connect(&metro);
+        metro.send(json!({"method": "Network.requestWillBeSent", "params": {
+            "requestId": "r2", "request": {"url": "https://down.test"}}}));
+        metro.send(json!({"method": "Network.loadingFailed", "params": {
+            "requestId": "r2", "errorText": "net::ERR_CONNECTION_REFUSED"}}));
+        let rec = wait_for(&c.rx, |e| match e {
+            RnEvent::Net(_, r) if r.failed.is_some() => Some(r),
+            _ => None,
+        });
+        assert_eq!(rec.method, "GET");
+        assert_eq!(rec.failed.as_deref(), Some("net::ERR_CONNECTION_REFUSED"));
+    }
+
+    #[test]
+    fn collects_websocket_frames() {
+        let metro = FakeMetro::start();
+        let c = connect(&metro);
+        metro.send(json!({"method": "Network.webSocketCreated", "params": {
+            "requestId": "w1", "url": "wss://live.test"}}));
+        metro.send(json!({"method": "Network.webSocketFrameSent", "params": {
+            "requestId": "w1", "response": {"opcode": 1, "payloadData": "ping"}}}));
+        metro.send(
+            json!({"method": "Network.webSocketFrameReceived", "params": {
+            "requestId": "w1", "response": {"opcode": 2, "payloadData": "AAEC"}}}),
+        );
+        let rec = wait_for(&c.rx, |e| match e {
+            RnEvent::Net(_, r) if r.ws_frames.len() == 2 => Some(r),
+            _ => None,
+        });
+        assert!(rec.is_ws);
+        assert_eq!(rec.method, "WS");
+        assert_eq!(
+            rec.ws_frames,
+            vec![(true, "ping".into()), (false, "[binary 4 bytes]".into())]
+        );
+    }
+
+    #[test]
+    fn caps_console_object_expansion() {
+        // Every object has five object children, forever: without the budget
+        // one log line would cost thousands of round trips.
+        let metro = FakeMetro::with(|req| match req["method"].as_str() {
+            Some("Runtime.getProperties") => {
+                let id = req["params"]["objectId"].as_str().unwrap_or("");
+                let props: Vec<Value> = (0..5)
+                    .map(|i| {
+                        json!({"name": format!("k{i}"), "enumerable": true,
+                        "value": {"type": "object", "objectId": format!("{id}.{i}")}})
+                    })
+                    .collect();
+                vec![reply(req, json!({ "result": props }))]
+            }
+            _ => vec![reply(req, json!({}))],
+        });
+        let c = connect(&metro);
+        metro.send(json!({"method": "Runtime.consoleAPICalled", "params": {
+            "type": "log", "args": [{"type": "object", "objectId": "o", "description": "Object"}]}}));
+        let entry = log_text(&c.rx, "Object");
+        assert_eq!(metro.requests("Runtime.getProperties").len(), EXPAND_BUDGET);
+        let tree = entry.expanded.expect("expanded tree").join("\n");
+        assert!(tree.contains("k4: "), "{tree}");
+        assert!(tree.contains("\"{…}\""), "{tree}");
+    }
+
+    #[test]
+    fn expands_a_console_object_into_js() {
+        let metro = FakeMetro::with(|req| {
+            match req["method"].as_str() {
+            Some("Runtime.getProperties") => vec![reply(
+                req,
+                json!({"result": [
+                    {"name": "id", "enumerable": true, "value": {"type": "number", "value": 7}},
+                    {"name": "tags", "enumerable": true, "value": {"type": "object", "objectId": "t"}},
+                    {"name": "hidden", "enumerable": false, "value": {"type": "number", "value": 1}},
+                ]}),
+            )]
+            .into_iter()
+            .filter(|_| req["params"]["objectId"] == "o")
+            .chain((req["params"]["objectId"] == "t").then(|| {
+                reply(
+                    req,
+                    json!({"result": [
+                        {"name": "0", "enumerable": true, "value": {"type": "string", "value": "a"}},
+                        {"name": "length", "enumerable": false, "value": {"type": "number", "value": 1}},
+                    ]}),
+                )
+            }))
+            .collect(),
+            _ => vec![reply(req, json!({}))],
+        }
+        });
+        let c = connect(&metro);
+        metro.send(json!({"method": "Runtime.consoleAPICalled", "params": {
+            "type": "warn", "args": [
+                {"type": "string", "value": "user"},
+                {"type": "object", "objectId": "o",
+                 "preview": {"properties": [{"name": "id", "type": "number", "value": "7"}]}}]}}));
+        let entry = log_text(&c.rx, "user { id: 7 }");
+        assert_eq!(entry.level, "warn");
+        assert_eq!(
+            entry.expanded.unwrap(),
+            vec!["{", "  id: 7,", "  tags: [", "    \"a\"", "  ]", "}"]
+        );
+    }
+
+    #[test]
+    fn symbolicates_console_stacks_and_marks_framework_frames() {
+        let metro = FakeMetro::start();
+        metro.set_symbolicated(json!([
+            {"methodName": "onPress", "file": "/app/src/App.tsx", "lineNumber": 12},
+            {"methodName": "", "file": "/app/node_modules/react/x.js", "lineNumber": 3, "collapse": true},
+        ]));
+        let c = connect(&metro);
+        let mut ev = console("tapped");
+        ev["params"]["stackTrace"] = json!({"callFrames": [
+            {"functionName": "a", "url": "http://localhost/index.bundle", "lineNumber": 99, "columnNumber": 4},
+            {"functionName": "b", "url": "http://localhost/index.bundle", "lineNumber": 5, "columnNumber": 1},
+        ]});
+        metro.send(ev);
+        let entry = log_text(&c.rx, "tapped");
+        assert_eq!(
+            entry.stack.unwrap(),
+            vec![
+                "  at onPress (/app/src/App.tsx:12)".to_string(),
+                format!("{FRAMEWORK_FRAME}at <anonymous> (/app/node_modules/react/x.js:3)"),
+            ]
+        );
+    }
+
+    #[test]
+    fn falls_back_to_bundle_positions_without_symbolication() {
+        let metro = FakeMetro::start();
+        let c = connect(&metro);
+        metro.send(json!({"method": "Runtime.exceptionThrown", "params": {"exceptionDetails": {
+            "text": "Uncaught", "exception": {"description": "TypeError: x is undefined"},
+            "stackTrace": {"callFrames": [
+                {"functionName": "", "url": "http://localhost:8081/index.bundle", "lineNumber": 41}]}}}}));
+        let entry = log_text(&c.rx, "TypeError: x is undefined");
+        assert_eq!(entry.level, "error");
+        assert_eq!(
+            entry.stack.unwrap(),
+            vec!["  at <anonymous> (index.bundle:42)"]
+        );
+    }
+
+    #[test]
+    fn passes_log_domain_entries_through() {
+        let metro = FakeMetro::start();
+        let c = connect(&metro);
+        metro.send(json!({"method": "Log.entryAdded", "params": {"entry": {
+            "level": "warning", "text": "slow frame"}}}));
+        assert_eq!(log_text(&c.rx, "slow frame").level, "warning");
+    }
+
+    #[test]
+    fn reports_a_pause_that_arrives_while_sampling_perf() {
+        // The perf sampler's evaluate is the first thing sent; Hermes pauses
+        // before replying. The pause must not be swallowed by the wait.
+        let metro = FakeMetro::with(|req| match req["method"].as_str() {
+            Some("Runtime.evaluate") => vec![
+                json!({"method": "Debugger.scriptParsed", "params": {
+                    "scriptId": "3", "url": "http://localhost:8081/index.bundle?platform=ios"}}),
+                json!({"method": "Debugger.paused", "params": {"reason": "other", "callFrames": [
+                    {"functionName": "f", "location": {"scriptId": "3", "lineNumber": 9, "columnNumber": 0}}]}}),
+                reply(req, json!({"result": {"value": 58}})),
+            ],
+            _ => vec![reply(req, json!({}))],
+        });
+        let c = connect(&metro);
+        let info = wait_for(&c.rx, |e| match e {
+            RnEvent::Paused(_, p) => Some(p),
+            _ => None,
+        });
+        assert_eq!(info.file, "http://localhost:8081/index.bundle?platform=ios");
+        assert_eq!(info.line, 10);
+        assert_eq!(info.reason, "other");
+        metro.send(json!({"method": "Debugger.resumed"}));
+        wait_for(&c.rx, |e| matches!(e, RnEvent::Resumed(_)).then_some(()));
+        // The bundle URL learned from scriptParsed is handed to the DAP server.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while c.bundle.lock().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "bundle URL not learned");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let fps = wait_for(&c.rx, |e| match e {
+            RnEvent::Perf(_, p) => Some(p.fps),
+            _ => None,
+        });
+        assert_eq!(fps, Some(58));
+    }
+
+    #[test]
+    fn answers_debug_requests_with_the_cdp_result() {
+        let metro = FakeMetro::with(|req| match req["method"].as_str() {
+            Some("Debugger.getScriptSource") => {
+                vec![reply(req, json!({"scriptSource": "var a = 1;"}))]
+            }
+            _ => vec![reply(req, json!({}))],
+        });
+        let c = connect(&metro);
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        c.cmd
+            .send(ConnCmd::DebugRequest {
+                method: "Debugger.getScriptSource".into(),
+                params: json!({"scriptId": "3"}),
+                reply: reply_tx,
+            })
+            .unwrap();
+        let result = reply_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(result["scriptSource"], "var a = 1;");
+        assert_eq!(
+            metro.requests("Debugger.getScriptSource")[0]["params"]["scriptId"],
+            "3"
+        );
+    }
+
+    #[test]
+    fn sends_ui_commands_to_the_target() {
+        let metro = FakeMetro::start();
+        let c = connect(&metro);
+        c.cmd.send(ConnCmd::Reload).unwrap();
+        c.cmd.send(ConnCmd::StepOver).unwrap();
+        c.cmd.send(ConnCmd::DiscardConsole).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while metro.requests("Log.clear").is_empty() {
+            assert!(Instant::now() < deadline, "commands not sent");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for m in [
+            "Page.reload",
+            "ReactNativeApplication.reload",
+            "Debugger.stepOver",
+            "Runtime.discardConsoleEntries",
+        ] {
+            assert_eq!(metro.requests(m).len(), 1, "{m}");
+        }
+    }
+
+    #[test]
+    fn clears_records_with_the_js_context() {
+        let metro = FakeMetro::start();
+        let c = connect(&metro);
+        metro.send(json!({"method": "Network.requestWillBeSent", "params": {
+            "requestId": "r3", "request": {"url": "https://a.test"}}}));
+        metro.send(json!({"method": "Runtime.executionContextsCleared"}));
+        // The record is gone: a late response for it is ignored.
+        metro.send(json!({"method": "Network.responseReceived", "params": {
+            "requestId": "r3", "response": {"status": 200}}}));
+        metro.send(json!({"method": "Runtime.executionContextCreated"}));
+        let mut saw_cleared = false;
+        wait_for(&c.rx, |e| match e {
+            RnEvent::ContextCleared(_) => {
+                saw_cleared = true;
+                None
+            }
+            RnEvent::Net(_, r) if r.status.is_some() => panic!("stale record updated"),
+            RnEvent::ContextCreated(_) => Some(()),
+            _ => None,
+        });
+        assert!(saw_cleared);
+    }
+
+    #[test]
+    fn attaches_to_a_new_target_quickly() {
+        // RN only reports network traffic once Network is enabled, so a
+        // freshly started app must be attached to within a poll or two.
+        let metro = FakeMetro::start();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let senders: Arc<Mutex<HashMap<String, Sender<ConnCmd>>>> = Arc::default();
+        let (port, s) = (metro.port, senders.clone());
+        std::thread::spawn(move || poll_loop(port, tx, s, Arc::default(), Arc::default()));
+        wait_for(&rx, |e| match e {
+            RnEvent::Targets(t) => t.is_empty().then_some(()),
+            _ => None,
+        });
+        let added = Instant::now();
+        metro.add_target("iPhone 16");
+        let key = wait_for(&rx, |e| match e {
+            RnEvent::Status(k, Status::Connected) => Some(k),
+            _ => None,
+        });
+        assert_eq!(key, "iPhone 16");
+        assert!(
+            added.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            added.elapsed()
+        );
+        assert!(senders.lock().unwrap().contains_key("iPhone 16"));
+        // Lost connections are dropped, so the next poll reconnects.
+        metro.close_all();
+        wait_for(&rx, |e| {
+            matches!(e, RnEvent::Status(_, Status::Disconnected)).then_some(())
+        });
+        wait_for(&rx, |e| {
+            matches!(e, RnEvent::Status(_, Status::Connected)).then_some(())
+        });
+    }
+
+    #[test]
+    fn attaches_devtools_and_reinstalls_the_tap_fix_after_a_reload() {
+        let metro = FakeMetro::with(|req| match req["params"]["expression"].as_str() {
+            Some(e) if e.contains("initializeDomain") => {
+                vec![reply(
+                    req,
+                    json!({"result": {"type": "string", "value": "ok"}}),
+                )]
+            }
+            _ => vec![reply(req, json!({}))],
+        });
+        let c = connect(&metro);
+        let fixes = || {
+            metro
+                .requests("Runtime.evaluate")
+                .iter()
+                .filter(|r| {
+                    r["params"]["expression"]
+                        .as_str()
+                        .is_some_and(|e| e.contains("__signalboxOriginal"))
+                })
+                .count()
+        };
+        let wait = |n: usize| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while fixes() < n {
+                assert!(
+                    Instant::now() < deadline,
+                    "tap fix not sent ({} of {n})",
+                    fixes()
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        c.cmd.send(ConnCmd::DevtoolsAttach).unwrap();
+        wait(1);
+        assert_eq!(metro.requests("Runtime.addBinding").len(), 1);
+        // A bridge message from the backend reaches the UI.
+        let msg = |event: &str, payload: Value| {
+            json!({"method": "Runtime.bindingCalled", "params": {
+                "name": DEVTOOLS_BINDING,
+                "payload": json!({"domain": "react-devtools", "message": {"event": event, "payload": payload}}).to_string(),
+            }})
+        };
+        metro.send(msg("operations", json!([1, 1, 0])));
+        let (event, payload) = wait_for(&c.rx, |e| match e {
+            RnEvent::Devtools(_, ev, p) => Some((ev, p)),
+            _ => None,
+        });
+        assert_eq!((event.as_str(), payload), ("operations", json!([1, 1, 0])));
+        // Reloaded: nothing is installed until the backend's first tree.
+        metro.send(json!({"method": "Runtime.executionContextCreated"}));
+        metro.send(console("after reload"));
+        log_text(&c.rx, "after reload");
+        assert_eq!(fixes(), 1);
+        metro.send(msg("operations", json!([1, 2, 0])));
+        wait(2);
+        // Detaching unsubscribes from the binding.
+        c.cmd.send(ConnCmd::DevtoolsDetach).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while metro.requests("Runtime.removeBinding").is_empty() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn formats_values_as_js() {
+        let v = json!({"a": [1, "x"], "b": {}, "c": null, "d": true, "e": []});
+        assert_eq!(
+            format_js(&v, ""),
+            "{\n  a: [\n    1,\n    \"x\"\n  ],\n  b: {},\n  c: null,\n  d: true,\n  e: []\n}"
+        );
+    }
+
+    #[test]
+    fn renders_console_args() {
+        assert_eq!(render_arg(&json!({"type": "string", "value": "hi"})), "hi");
+        assert_eq!(render_arg(&json!({"type": "number", "value": 3})), "3");
+        assert_eq!(render_arg(&json!({"type": "undefined"})), "undefined");
+        assert_eq!(
+            render_arg(&json!({"type": "function", "description": "function f() {}"})),
+            "function f() {}"
+        );
+        let arr = json!({"preview": {"subtype": "array", "properties": [
+            {"name": "0", "type": "number", "value": "1"},
+            {"name": "1", "type": "object", "valuePreview": {"properties": [
+                {"name": "x", "type": "string", "value": "y"}]}}]}});
+        assert_eq!(render_arg(&arr), "[1, { x: y }]");
+    }
+
+    #[test]
+    fn decodes_base64_bodies() {
+        assert_eq!(base64_lite::decode("aGVsbG8gd29ybGQ="), "hello world");
+        assert_eq!(base64_lite::decode("eyJhIjoxfQ=="), "{\"a\":1}");
+        assert_eq!(base64_lite::decode(""), "");
+    }
+
+    #[test]
+    fn reads_bundle_positions_from_a_js_stack() {
+        let stack = "Error: react-stack-top-frame\n    at jsxDEV (http://localhost:8081/index.bundle?platform=ios:2017:21)\n    at List (address at http://localhost:8081/index.bundle?platform=ios:9001:7)\n    at native\n    at http://localhost:8081/index.bundle?platform=ios:5:1";
+        assert_eq!(
+            stack_text_frames(stack),
+            vec![
+                (
+                    "http://localhost:8081/index.bundle?platform=ios".to_string(),
+                    2017,
+                    21
+                ),
+                (
+                    "http://localhost:8081/index.bundle?platform=ios".to_string(),
+                    9001,
+                    7
+                ),
+                (
+                    "http://localhost:8081/index.bundle?platform=ios".to_string(),
+                    5,
+                    1
+                ),
+            ]
+        );
     }
 }

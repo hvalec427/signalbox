@@ -14,11 +14,25 @@ on:
 permissions:
   contents: write
 
+# One queue per ring (master / develop / nightly). GitHub keeps only one pending
+# run per group, so a shared group let a develop push cancel a queued nightly.
 concurrency:
-  group: release
+  group: release-${{ github.event_name == 'push' && github.ref_name || 'nightly' }}
   cancel-in-progress: false
 
 jobs:
+  # Every commit pushed to develop must be conventional: versions are derived
+  # from them (scripts/next-version.sh). master only receives develop's commits.
+  commitlint:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check conventional commits
+        run: bash scripts/commit-lint.sh "${{ github.event.before }}..${{ github.sha }}"
+
   # Scheduled runs always use the workflow file on the default branch (master),
   # which lags develop. This job only re-dispatches the workflow on develop, so
   # the nightly build runs develop's own definition.
@@ -33,8 +47,14 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref develop
 
+  # fmt, clippy and tests; nothing is released unless they pass.
+  check:
+    if: github.event_name != 'schedule'
+    uses: ./.github/workflows/check.yml
+
   release:
     if: github.event_name != 'schedule'
+    needs: check
     # macOS: binaries are built for both Apple targets and ad-hoc code-signed.
     runs-on: macos-latest
     steps:

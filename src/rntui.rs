@@ -12,21 +12,40 @@ pub fn run(port: u16, name: Option<&str>) -> Result<()> {
     let client = RnClient::start(port);
     let mut view = RnView::new(name);
     // Standalone `logs` is run from the project dir — resolve frame paths against it.
-    view.set_root(std::env::current_dir().ok().and_then(|p| p.to_str().map(String::from)));
+    view.set_root(
+        std::env::current_dir()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from)),
+    );
+    crate::devlog::log(
+        "logs",
+        format!(
+            "started (signalbox {}), Metro port {port}",
+            env!("CARGO_PKG_VERSION")
+        ),
+    );
     let mut terminal = ratatui::init();
     let res = main_loop(&mut view, &mut terminal, &client);
     ratatui::restore();
     res
 }
 
-fn main_loop(view: &mut RnView, terminal: &mut ratatui::DefaultTerminal, client: &RnClient) -> Result<()> {
+fn main_loop(
+    view: &mut RnView,
+    terminal: &mut ratatui::DefaultTerminal,
+    client: &RnClient,
+) -> Result<()> {
     loop {
         while let Ok(ev) = client.rx.try_recv() {
             view.on_event(ev);
         }
+        view.tick(client);
         terminal.draw(|f| view.render(f, f.area()))?;
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(k) = event::read()? {
+                if k.kind == KeyEventKind::Press {
+                    crate::devlog::log("logs", format!("key {:?}", k.code));
+                }
                 if k.kind == KeyEventKind::Press && view.on_key(k, client) {
                     return Ok(());
                 }

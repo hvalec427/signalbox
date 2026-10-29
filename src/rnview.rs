@@ -1,9 +1,13 @@
 //! The React Native log viewer as an embeddable component. Holds the per-device
-//! Logs / Network / Perf state, reduces `RnEvent`s from `RnClient`, and renders
+//! Logs / Network / Perf / Components state, reduces `RnEvent`s from `RnClient`, and renders
 //! itself into an arbitrary `Rect` (the full screen for `logs --rn`, a pane in
-//! `metroctl`). Extracted from the old `rntui` so both share one implementation.
+//! `signalbox`). Extracted from the old `rntui` so both share one implementation.
 
-use crate::rnclient::{format_js, ConnCmd, LogEntry, NetRecord, PausedInfo, RnClient, RnEvent, Status, TargetInfo};
+use crate::components::{parse_edit, Tree};
+use crate::rnclient::{
+    format_js, ConnCmd, LogEntry, NetRecord, PausedInfo, RnClient, RnEvent, Status, TargetInfo,
+    FRAMEWORK_FRAME,
+};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
@@ -13,7 +17,11 @@ use std::process::{Command, Stdio};
 const MAX_LINES: usize = 5000;
 const MAX_NET: usize = 1000;
 const PERF_HISTORY: usize = 60;
-const METHODS: [&str; 8] = ["ALL", "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+/// Narrower than this, the list and the detail pane take turns on screen.
+const MIN_SPLIT: usize = 60;
+const METHODS: [&str; 8] = [
+    "ALL", "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS",
+];
 
 // ── pure helpers ─────────────────────────────────────────────────────────────
 
@@ -29,7 +37,10 @@ pub fn graphql_operation(rec: &NetRecord) -> Option<String> {
             for kw in ["query", "mutation", "subscription"] {
                 if let Some(idx) = q.find(kw) {
                     let rest = q[idx + kw.len()..].trim_start();
-                    let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                    let name: String = rest
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
                     if !name.is_empty() {
                         return Some(name);
                     }
@@ -41,7 +52,11 @@ pub fn graphql_operation(rec: &NetRecord) -> Option<String> {
     }
     if let Some(arr) = v.as_array() {
         let ops: Vec<String> = arr.iter().filter_map(pick).collect();
-        return if ops.is_empty() { None } else { Some(ops.join(", ")) };
+        return if ops.is_empty() {
+            None
+        } else {
+            Some(ops.join(", "))
+        };
     }
     pick(&v)
 }
@@ -71,7 +86,9 @@ pub fn net_summary(rec: &NetRecord) -> String {
     } else if rec.is_ws {
         "WS".into()
     } else {
-        rec.status.map(|s| s.to_string()).unwrap_or_else(|| "···".into())
+        rec.status
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "···".into())
     };
     let dur = fmt_duration(rec.duration_ms);
     let op = graphql_operation(rec);
@@ -102,7 +119,11 @@ fn sh_quote(s: &str) -> String {
 pub fn to_curl(rec: &NetRecord) -> String {
     let method = rec.method.to_uppercase();
     let head = method == "HEAD";
-    let mut parts = vec![if head { format!("curl -I {}", sh_quote(&rec.url)) } else { format!("curl -X {method} {}", sh_quote(&rec.url)) }];
+    let mut parts = vec![if head {
+        format!("curl -I {}", sh_quote(&rec.url))
+    } else {
+        format!("curl -X {method} {}", sh_quote(&rec.url))
+    }];
     for (k, v) in &rec.req_headers {
         parts.push(format!("-H {}", sh_quote(&format!("{k}: {v}"))));
     }
@@ -112,18 +133,29 @@ pub fn to_curl(rec: &NetRecord) -> String {
     parts.join(" \\\n  ")
 }
 
+fn truncate(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => format!("{}… ({} more chars)", &s[..i], s[i..].chars().count()),
+        None => s.to_string(),
+    }
+}
+
 fn one_line(s: &str) -> String {
     s.replace(['\r', '\n', '\t'], " ")
 }
 
 fn pretty_or_raw(body: &str) -> Vec<String> {
     match serde_json::from_str::<serde_json::Value>(body) {
-        Ok(v) => serde_json::to_string_pretty(&v).unwrap_or_else(|_| body.to_string()).lines().map(|l| format!("  {l}")).collect(),
+        Ok(v) => serde_json::to_string_pretty(&v)
+            .unwrap_or_else(|_| body.to_string())
+            .lines()
+            .map(|l| format!("  {l}"))
+            .collect(),
         Err(_) => body.lines().map(|l| format!("  {l}")).collect(),
     }
 }
 
-fn log_detail_lines(e: &LogEntry) -> Vec<String> {
+fn log_detail_lines(e: &LogEntry, show_framework: bool) -> Vec<String> {
     let mut out = if let Some(tree) = &e.expanded {
         let mut out = vec![e.text.clone(), String::new()];
         out.extend(tree.clone());
@@ -137,7 +169,19 @@ fn log_detail_lines(e: &LogEntry) -> Vec<String> {
     if let Some(stack) = &e.stack {
         out.push(String::new());
         out.push("── Stack ──".into());
-        out.extend(stack.clone());
+        let hidden = stack
+            .iter()
+            .filter(|l| l.starts_with(FRAMEWORK_FRAME))
+            .count();
+        out.extend(
+            stack
+                .iter()
+                .filter(|l| show_framework || !l.starts_with(FRAMEWORK_FRAME))
+                .cloned(),
+        );
+        if hidden > 0 && !show_framework {
+            out.push(format!("  ({hidden} framework frames hidden — F to show)"));
+        }
     }
     out
 }
@@ -145,7 +189,12 @@ fn log_detail_lines(e: &LogEntry) -> Vec<String> {
 fn net_detail_lines(rec: &NetRecord) -> Vec<String> {
     let mut out = Vec::new();
     out.push(format!("{} {}", rec.method, rec.url));
-    let mut status = format!("Status: {}", rec.status.map(|s| s.to_string()).unwrap_or_else(|| "(pending)".into()));
+    let mut status = format!(
+        "Status: {}",
+        rec.status
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "(pending)".into())
+    );
     if let Some(d) = rec.duration_ms {
         status.push_str(&format!("  ·  {}", fmt_duration(Some(d))));
     }
@@ -172,7 +221,11 @@ fn net_detail_lines(rec: &NetRecord) -> Vec<String> {
         for (sent, payload) in &rec.ws_frames {
             let arrow = if *sent { "↑" } else { "↓" };
             for (i, line) in payload.lines().enumerate() {
-                out.push(if i == 0 { format!("  {arrow} {line}") } else { format!("    {line}") });
+                out.push(if i == 0 {
+                    format!("  {arrow} {line}")
+                } else {
+                    format!("    {line}")
+                });
             }
         }
         return out;
@@ -197,10 +250,10 @@ fn net_detail_lines(rec: &NetRecord) -> Vec<String> {
             Some(s) => out.extend(pretty_or_raw(s)),
         }
     };
-    section(&mut out, "Request headers", &rec.req_headers);
+    body(&mut out, "Response body", &rec.res_body);
     body(&mut out, "Request body", &rec.req_body);
     section(&mut out, "Response headers", &rec.res_headers);
-    body(&mut out, "Response body", &rec.res_body);
+    section(&mut out, "Request headers", &rec.req_headers);
     out
 }
 
@@ -229,14 +282,41 @@ struct Device {
     status: Status,
     network_supported: bool,
     was_disconnected: bool,
+    has_context: bool, // seen this connection's first executionContextCreated
     perf: PerfState,
     /// `Some` while the JS VM is suspended at a breakpoint/step on this device.
     paused: Option<PausedInfo>,
+    // Totals ever added, so entries keep stable sequence numbers (for `since`
+    // over the control socket) across trimming and clears: logs[i] has seq
+    // `log_seq - logs.len() + i`.
+    log_seq: u64,
+    net_seq: u64,
+    /// The React component tree (Components tab).
+    comp: Tree,
 }
 
 impl Default for Device {
     fn default() -> Self {
-        Device { logs: Vec::new(), net: Vec::new(), status: Status::Connecting, network_supported: true, was_disconnected: false, perf: PerfState::default(), paused: None }
+        Device {
+            logs: Vec::new(),
+            net: Vec::new(),
+            status: Status::Connecting,
+            network_supported: true,
+            was_disconnected: false,
+            has_context: false,
+            perf: PerfState::default(),
+            paused: None,
+            log_seq: 0,
+            net_seq: 0,
+            comp: Tree::default(),
+        }
+    }
+}
+
+impl Device {
+    fn clear(&mut self) {
+        self.logs.clear();
+        self.net.clear();
     }
 }
 
@@ -245,6 +325,7 @@ enum Tab {
     Logs,
     Network,
     Perf,
+    Components,
 }
 
 #[derive(PartialEq)]
@@ -252,6 +333,8 @@ enum Mode {
     Normal,
     Search,
     Filter,
+    /// Typing a prop edit for the selected component (`e`).
+    Edit,
 }
 
 pub struct RnView {
@@ -260,11 +343,10 @@ pub struct RnView {
     active: Option<String>,
     name_filter: Option<String>,
     tab: Tab,
-    sel: [usize; 3],
+    sel: [usize; 4],
     follow: bool,
+    /// The detail pane (right of the list) has focus.
     detail: bool,
-    maximized: bool,
-    opened_by_max: bool,
     detail_scroll: usize,
     detail_hit: Option<usize>, // active match line in the pane (for n/N + current highlight)
     detail_width: usize,       // pane width as last rendered (so n/N wrap matches)
@@ -275,14 +357,22 @@ pub struct RnView {
     input: String,
     clear_on_restart: bool,
     errors_only: bool,
+    show_framework: bool, // include collapsed React/RN frames in stacks
     method_idx: usize,
     flash: Option<String>,
-    focused: bool, // when embedded: dim the footer unless the logs pane is active
+    focused: bool,  // when embedded: dim the footer unless the logs pane is active
+    embedded: bool, // inside the dashboard, whose status bar already lists R/q
     // Vim-style linewise visual selection. The anchor is a list-row index when
-    // the list is active, or a wrapped-preview-line index when maximized.
+    // the list has focus, or a wrapped detail-line index when the detail has.
     visual: Option<usize>,
-    detail_cursor: usize, // current line in the maximized preview
+    detail_cursor: usize, // current line in the detail pane
     root: Option<String>, // project root, to resolve relative stack-frame paths
+    /// React DevTools bridge messages waiting to go to an app: (device, event, payload).
+    /// Commands waiting to go to an app, in order: (device, command).
+    outbox: Vec<(String, ConnCmd)>,
+    devtools_request: i64, // inspectElement request ids
+    /// The device with the selected component outlined.
+    highlight: Option<String>,
 }
 
 impl RnView {
@@ -293,11 +383,9 @@ impl RnView {
             active: None,
             name_filter: name.map(|s| s.to_lowercase()),
             tab: Tab::Logs,
-            sel: [0, 0, 0],
+            sel: [0, 0, 0, 0],
             follow: true,
             detail: false,
-            maximized: false,
-            opened_by_max: false,
             detail_scroll: 0,
             detail_hit: None,
             detail_width: 80,
@@ -308,12 +396,17 @@ impl RnView {
             input: String::new(),
             clear_on_restart: false,
             errors_only: false,
+            show_framework: false,
             method_idx: 0,
             flash: None,
             focused: true,
+            embedded: false,
             visual: None,
             detail_cursor: 0,
             root: None,
+            outbox: Vec::new(),
+            devtools_request: 0,
+            highlight: None,
         }
     }
 
@@ -323,8 +416,13 @@ impl RnView {
         self.root = root;
     }
 
+    /// Whether the list sticks to its newest row (never in the component tree).
+    fn following(&self) -> bool {
+        self.follow && self.tab != Tab::Components
+    }
+
     fn eff_sel(&self, len: usize) -> usize {
-        if self.follow {
+        if self.following() {
             len.saturating_sub(1)
         } else {
             self.sel[self.tab_idx()].min(len.saturating_sub(1))
@@ -334,6 +432,10 @@ impl RnView {
     /// When embedded in the dashboard, controls whether the footer is shown
     /// bright (active pane) or blank (another pane has focus). Standalone
     /// `logs --rn` leaves this true.
+    pub fn set_embedded(&mut self, embedded: bool) {
+        self.embedded = embedded;
+    }
+
     pub fn set_focused(&mut self, focused: bool) {
         self.focused = focused;
     }
@@ -357,13 +459,173 @@ impl RnView {
         Some(format!("⏸ PAUSED {}:{} ({})", p.file, p.line, p.reason))
     }
 
+    /// The device a control-socket query is about: the first whose key or label
+    /// contains `name`, else the active one.
+    fn query_device(&self, name: Option<&str>) -> Option<(&str, &Device)> {
+        let key = match name.map(str::to_lowercase) {
+            Some(n) => self
+                .targets
+                .iter()
+                .find(|t| t.key.to_lowercase().contains(&n) || t.label.to_lowercase().contains(&n))
+                .map(|t| t.key.as_str()),
+            None => self.active.as_deref(),
+        }?;
+        self.devices
+            .get_key_value(key)
+            .map(|(k, d)| (k.as_str(), d))
+    }
+
+    /// Connected apps, for the control socket's `status`.
+    pub fn apps_json(&self) -> serde_json::Value {
+        let apps: Vec<serde_json::Value> = self
+            .targets
+            .iter()
+            .map(|t| {
+                let d = self.devices.get(&t.key);
+                serde_json::json!({
+                    "device": t.label,
+                    "status": format!("{:?}", d.map(|d| d.status.clone()).unwrap_or(Status::Connecting)).to_lowercase(),
+                    "paused": d.and_then(|d| d.paused.as_ref()).map(|p| format!("{}:{} ({})", p.file, p.line, p.reason)),
+                    "logs": d.map_or(0, |d| d.logs.len()),
+                    "requests": d.map_or(0, |d| d.net.len()),
+                })
+            })
+            .collect();
+        serde_json::Value::Array(apps)
+    }
+
+    /// JS console entries from `since` (a seq), newest `limit` that match.
+    /// `level`: "error" = errors only, "warn" = warnings and errors.
+    pub fn logs_json(
+        &self,
+        device: Option<&str>,
+        level: Option<&str>,
+        filter: Option<&str>,
+        since: u64,
+        limit: usize,
+    ) -> serde_json::Value {
+        let Some((key, d)) = self.query_device(device) else {
+            return serde_json::json!({ "error": "no app connected to Metro" });
+        };
+        let filter = filter.map(str::to_lowercase);
+        let first = d.log_seq - d.logs.len() as u64;
+        let mut hits: Vec<serde_json::Value> = d
+            .logs
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (first + i as u64, e))
+            .filter(|(seq, e)| {
+                *seq >= since
+                    && match level {
+                        Some("error") => e.level == "error",
+                        Some("warn") => e.level == "error" || e.level == "warn" || e.level == "warning",
+                        _ => true,
+                    }
+                    && filter.as_ref().is_none_or(|f| e.text.to_lowercase().contains(f))
+            })
+            .map(|(seq, e)| {
+                let mut v = serde_json::json!({ "seq": seq, "level": e.level, "text": truncate(&e.text, 4000) });
+                // Logged objects arrive as a preview ("Object"); include the fetched tree.
+                if let Some(tree) = &e.expanded {
+                    let mut lines: Vec<String> = tree.iter().take(60).map(|l| truncate(l, 500)).collect();
+                    if tree.len() > 60 {
+                        lines.push(format!("… {} more lines", tree.len() - 60));
+                    }
+                    v["details"] = serde_json::json!(lines);
+                }
+                if let Some(stack) = &e.stack {
+                    // Project-relative paths: shorter, and what an agent edits.
+                    let prefix = self.root.as_ref().map(|r| format!("{}/", r.trim_end_matches('/')));
+                    let own: Vec<String> = stack
+                        .iter()
+                        .filter(|l| !l.starts_with(FRAMEWORK_FRAME))
+                        .take(15)
+                        .map(|l| match &prefix {
+                            Some(p) => l.replace(p.as_str(), ""),
+                            None => l.clone(),
+                        })
+                        .collect();
+                    v["stack"] = serde_json::json!(own);
+                }
+                v
+            })
+            .collect();
+        let total = hits.len();
+        hits.drain(..total.saturating_sub(limit));
+        serde_json::json!({ "device": key, "next": d.log_seq, "matched": total, "entries": hits })
+    }
+
+    /// Network requests from `since` (a seq), newest `limit` that match.
+    pub fn net_json(
+        &self,
+        device: Option<&str>,
+        failed_only: bool,
+        filter: Option<&str>,
+        since: u64,
+        limit: usize,
+    ) -> serde_json::Value {
+        let Some((key, d)) = self.query_device(device) else {
+            return serde_json::json!({ "error": "no app connected to Metro" });
+        };
+        let filter = filter.map(str::to_lowercase);
+        let first = d.net_seq - d.net.len() as u64;
+        let mut hits: Vec<serde_json::Value> = d
+            .net
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (first + i as u64, r))
+            .filter(|(seq, r)| {
+                *seq >= since
+                    && (!failed_only || net_error(r))
+                    && filter.as_ref().is_none_or(|f| {
+                        r.url.to_lowercase().contains(f)
+                            || graphql_operation(r).is_some_and(|o| o.to_lowercase().contains(f))
+                    })
+            })
+            .map(|(seq, r)| {
+                serde_json::json!({
+                    "seq": seq,
+                    "id": r.id,
+                    "method": r.method,
+                    "url": r.url,
+                    "status": r.status,
+                    "failed": r.failed,
+                    "ms": r.duration_ms.map(|d| d.round() as i64),
+                    "graphql": graphql_operation(r),
+                })
+            })
+            .collect();
+        let total = hits.len();
+        hits.drain(..total.saturating_sub(limit));
+        serde_json::json!({ "device": key, "next": d.net_seq, "matched": total, "requests": hits })
+    }
+
+    /// One request in full (headers and bodies), as text.
+    pub fn request_text(&self, device: Option<&str>, id: &str) -> Option<String> {
+        let (_, d) = self.query_device(device)?;
+        let r = d.net.iter().find(|r| r.id == id)?;
+        Some(
+            net_detail_lines(r)
+                .iter()
+                .map(|l| truncate(l, 20_000))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
         render_view(self, frame, area);
     }
 
     /// Returns true to quit.
     pub fn on_key(&mut self, key: KeyEvent, client: &RnClient) -> bool {
-        handle_key(self, key, client)
+        let filter = self.filter.clone();
+        let quit = handle_key(self, key, client);
+        if self.filter != filter {
+            self.anchor_comp_cursor(); // keep the selection when it's still shown
+        }
+        self.sync_comp_selection();
+        quit
     }
 
     fn tab_idx(&self) -> usize {
@@ -371,6 +633,7 @@ impl RnView {
             Tab::Logs => 0,
             Tab::Network => 1,
             Tab::Perf => 2,
+            Tab::Components => 3,
         }
     }
 
@@ -385,30 +648,43 @@ impl RnView {
                     self.devices.entry(t.key.clone()).or_default();
                 }
                 if self.active.is_none() && !list.is_empty() {
-                    let matched = self.name_filter.as_ref().and_then(|n| list.iter().find(|t| t.key.to_lowercase().contains(n)));
-                    self.active = Some(matched.map(|t| t.key.clone()).unwrap_or_else(|| list[0].key.clone()));
+                    let matched = self
+                        .name_filter
+                        .as_ref()
+                        .and_then(|n| list.iter().find(|t| t.key.to_lowercase().contains(n)));
+                    self.active = Some(
+                        matched
+                            .map(|t| t.key.clone())
+                            .unwrap_or_else(|| list[0].key.clone()),
+                    );
                 }
                 self.targets = list;
             }
             RnEvent::Status(key, s) => {
                 let clear = self.clear_on_restart;
                 let d = self.dev(&key);
+                // A new connection hasn't been attached to the backend yet.
+                if s != d.status {
+                    d.comp.reset();
+                    d.comp.attached = false;
+                }
                 if s == Status::Disconnected {
                     d.was_disconnected = true;
                     d.paused = None; // a gone VM can't still be suspended
                 }
                 if s == Status::Connected {
                     if d.was_disconnected && clear {
-                        d.logs.clear();
-                        d.net.clear();
+                        d.clear();
                     }
                     d.was_disconnected = false;
+                    d.has_context = false;
                 }
                 d.status = s;
             }
             RnEvent::Log(key, e) => {
                 let d = self.dev(&key);
                 d.logs.push(e);
+                d.log_seq += 1;
                 if d.logs.len() > MAX_LINES {
                     d.logs.remove(0);
                 }
@@ -419,6 +695,7 @@ impl RnView {
                     *existing = rec;
                 } else {
                     d.net.push(rec);
+                    d.net_seq += 1;
                     if d.net.len() > MAX_NET {
                         d.net.remove(0);
                     }
@@ -434,14 +711,25 @@ impl RnView {
             RnEvent::Resumed(key) => {
                 self.dev(&key).paused = None;
             }
+            // A reload (Metro `r`, ⇧R, dev menu) swaps the JS context: RN sends
+            // contextsCleared, and a fresh executionContextCreated after the
+            // first one on a connection means the same. Fast Refresh keeps the
+            // context, so it doesn't clear.
             RnEvent::ContextCleared(key) => {
-                let clear = self.clear_on_restart;
-                let d = self.dev(&key);
-                if clear {
-                    d.logs.clear();
-                    d.net.clear();
+                self.dev(&key).comp.reset(); // the backend sends a new tree
+                if self.clear_on_restart {
+                    self.dev(&key).clear();
                 }
             }
+            RnEvent::ContextCreated(key) => {
+                let clear = self.clear_on_restart;
+                let d = self.dev(&key);
+                if d.has_context && clear {
+                    d.clear();
+                }
+                d.has_context = true;
+            }
+            RnEvent::Devtools(key, event, payload) => self.on_devtools(&key, &event, payload),
             RnEvent::Perf(key, s) => {
                 let d = self.dev(&key);
                 if let Some(f) = s.fps {
@@ -450,7 +738,12 @@ impl RnView {
                         d.perf.history.remove(0);
                     }
                 }
-                d.perf = PerfState { fps: s.fps, heap_used: s.heap_used, heap_total: s.heap_total, history: d.perf.history.clone() };
+                d.perf = PerfState {
+                    fps: s.fps,
+                    heap_used: s.heap_used,
+                    heap_total: s.heap_total,
+                    history: d.perf.history.clone(),
+                };
             }
         }
     }
@@ -467,7 +760,13 @@ impl RnView {
                 .logs
                 .iter()
                 .filter(|e| f.is_empty() || e.text.to_lowercase().contains(&f))
-                .map(|e| (one_line(&e.text), e.level == "error" || e.level == "assert", e.level.clone()))
+                .map(|e| {
+                    (
+                        one_line(&e.text),
+                        e.level == "error" || e.level == "assert",
+                        e.level.clone(),
+                    )
+                })
                 .collect(),
             Tab::Network => {
                 let method = METHODS[self.method_idx];
@@ -483,11 +782,20 @@ impl RnView {
                     .collect()
             }
             Tab::Perf => Vec::new(),
+            Tab::Components => d
+                .comp
+                .rows_shifted(&self.filter, self.comp_shift(&d.comp))
+                .into_iter()
+                .map(|r| (r.text, false, "comp".into()))
+                .collect(),
         }
     }
 
     fn detail_wrapped(&self) -> Vec<String> {
-        self.detail_source().iter().flat_map(|l| wrap(l, self.detail_width.max(1))).collect()
+        self.detail_source()
+            .iter()
+            .flat_map(|l| wrap(l, self.detail_width.max(1)))
+            .collect()
     }
 
     fn detail_source(&self) -> Vec<String> {
@@ -502,8 +810,17 @@ impl RnView {
         };
         match self.tab {
             Tab::Logs => {
-                let list: Vec<&LogEntry> = d.logs.iter().filter(|e| self.filter.is_empty() || e.text.to_lowercase().contains(&self.filter.to_lowercase())).collect();
-                list.get(idx).map(|e| log_detail_lines(e)).unwrap_or_default()
+                let list: Vec<&LogEntry> = d
+                    .logs
+                    .iter()
+                    .filter(|e| {
+                        self.filter.is_empty()
+                            || e.text.to_lowercase().contains(&self.filter.to_lowercase())
+                    })
+                    .collect();
+                list.get(idx)
+                    .map(|e| log_detail_lines(e, self.show_framework))
+                    .unwrap_or_default()
             }
             Tab::Network => {
                 let method = METHODS[self.method_idx];
@@ -511,12 +828,384 @@ impl RnView {
                 let list: Vec<&NetRecord> = d
                     .net
                     .iter()
-                    .filter(|r| (f.is_empty() || net_summary(r).to_lowercase().contains(&f)) && (!self.errors_only || net_error(r)) && (method == "ALL" || r.method.to_uppercase() == method))
+                    .filter(|r| {
+                        (f.is_empty() || net_summary(r).to_lowercase().contains(&f))
+                            && (!self.errors_only || net_error(r))
+                            && (method == "ALL" || r.method.to_uppercase() == method)
+                    })
                     .collect();
-                list.get(idx).map(|r| net_detail_lines(r)).unwrap_or_default()
+                list.get(idx)
+                    .map(|r| net_detail_lines(r))
+                    .unwrap_or_default()
             }
             Tab::Perf => Vec::new(),
+            // Source paths inside the project read relative to it.
+            Tab::Components => match &self.root {
+                Some(root) => {
+                    let prefix = format!("({}/", root.trim_end_matches('/'));
+                    d.comp
+                        .detail_lines()
+                        .into_iter()
+                        .map(|l| l.replace(&prefix, "("))
+                        .collect()
+                }
+                None => d.comp.detail_lines(),
+            },
         }
+    }
+
+    // ── Components tab ──
+
+    /// How many levels the tree is shifted left, so the cursor's row stays
+    /// readable: it's never indented more than a third of the pane.
+    fn comp_shift(&self, t: &Tree) -> usize {
+        let room = (self.detail_width.max(30) / 3).max(8);
+        let rows = t.rows(&self.filter);
+        rows.get(self.sel[3].min(rows.len().saturating_sub(1)))
+            .map_or(0, |r| r.depth.saturating_sub(room))
+    }
+
+    fn active_tree(&self) -> Option<&Tree> {
+        self.devices.get(self.active.as_ref()?).map(|d| &d.comp)
+    }
+
+    fn active_tree_mut(&mut self) -> Option<&mut Tree> {
+        let key = self.active.clone()?;
+        self.devices.get_mut(&key).map(|d| &mut d.comp)
+    }
+
+    /// The component at the cursor becomes the selected (inspected) one.
+    fn sync_comp_selection(&mut self) {
+        if self.tab != Tab::Components {
+            return;
+        }
+        let filter = self.filter.clone();
+        let sel = self.sel[3];
+        if let Some(t) = self.active_tree_mut() {
+            let rows = t.rows(&filter);
+            t.selected = rows
+                .get(sel.min(rows.len().saturating_sub(1)))
+                .map(|r| r.id);
+        }
+    }
+
+    /// Keep the cursor on the selected component when the tree changes.
+    fn anchor_comp_cursor(&mut self) {
+        let filter = self.filter.clone();
+        let Some(t) = self.active_tree() else {
+            return;
+        };
+        let Some(id) = t.selected else {
+            return;
+        };
+        if let Some(i) = t.rows(&filter).iter().position(|r| r.id == id) {
+            self.sel[3] = i;
+        }
+    }
+
+    fn on_devtools(&mut self, key: &str, event: &str, payload: serde_json::Value) {
+        let active = self.active.as_deref() == Some(key);
+        let filter = self.filter.clone();
+        let t = &mut self.dev(key).comp;
+        match event {
+            "operations" => {
+                let ops: Vec<i64> = payload
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
+                    .unwrap_or_default();
+                if let Err(e) = t.apply(&ops) {
+                    t.error = Some(e);
+                }
+            }
+            "selectElement" => {
+                if let Some(id) = payload.as_i64() {
+                    t.reveal(id);
+                    let hidden = !t.rows(&filter).iter().any(|r| r.id == id);
+                    if active && hidden {
+                        self.filter.clear();
+                    }
+                    let t = &mut self.dev(key).comp;
+                    if t.picking {
+                        t.picking = false;
+                        let msg = devtools_msg("stopInspectingHost", serde_json::json!(false));
+                        self.outbox.push((key.to_string(), msg));
+                    }
+                    if active {
+                        self.flash = Some("selected the tapped component".into());
+                    }
+                }
+            }
+            "stopInspectingHost" => t.picking = false,
+            "inspectedElement" => t.on_inspected(&payload),
+            "signalbox:unavailable" => t.unavailable = payload.as_str().map(String::from),
+            _ => {}
+        }
+        if active {
+            self.anchor_comp_cursor();
+        }
+    }
+
+    /// Talk to the apps' React DevTools backends: attach the active app while
+    /// the Components tab is open (detaching otherwise, so React Native
+    /// DevTools can have it), and send what the tab needs. Call once per frame.
+    pub fn tick(&mut self, client: &RnClient) {
+        let want = (self.tab == Tab::Components)
+            .then(|| self.active.clone())
+            .flatten();
+        // Clear the outline when leaving the tab.
+        if let Some(key) = &self.highlight {
+            if want.as_deref() != Some(key.as_str()) {
+                client.send(
+                    key,
+                    devtools_msg("clearHostInstanceHighlight", serde_json::Value::Null),
+                );
+                self.highlight = None;
+            }
+        }
+        let keys: Vec<String> = self.devices.keys().cloned().collect();
+        for key in keys {
+            let d = self.devices.get_mut(&key).unwrap();
+            let wanted = want.as_deref() == Some(key.as_str());
+            if d.comp.attached && !wanted {
+                if d.comp.picking {
+                    client.send(
+                        &key,
+                        devtools_msg("stopInspectingHost", serde_json::json!(false)),
+                    );
+                }
+                client.send(&key, ConnCmd::DevtoolsDetach);
+                d.comp.reset();
+                d.comp.attached = false;
+            } else if wanted && !d.comp.attached && d.status == Status::Connected {
+                d.comp.reset();
+                d.comp.unavailable = None;
+                d.comp.error = None;
+                d.comp.attached = true;
+                client.send(&key, ConnCmd::DevtoolsAttach);
+            }
+        }
+        for (key, cmd) in self.outbox.drain(..) {
+            client.send(&key, cmd);
+        }
+        let Some(key) = want else {
+            return;
+        };
+        // A fresh tree (attach, reload): inspect what the cursor is on.
+        if self
+            .active_tree()
+            .is_some_and(|t| t.attached && t.selected.is_none())
+        {
+            self.sync_comp_selection();
+        }
+        let Some(t) = self.devices.get_mut(&key).map(|d| &mut d.comp) else {
+            return;
+        };
+        if !t.attached {
+            return;
+        }
+        while let Some(r) = t.next_request() {
+            self.devtools_request += 1;
+            if r.path.is_none() {
+                // Outline it on the device, like hovering it in React DevTools.
+                // Again with each refresh, so the outline follows it around.
+                client.send(
+                    &key,
+                    devtools_msg(
+                        "highlightHostInstance",
+                        serde_json::json!({
+                            "id": r.id, "rendererID": r.renderer,
+                            "displayName": t.name(r.id), "hideAfterTimeout": false,
+                            "openBuiltinElementsPanel": false, "scrollIntoView": false,
+                        }),
+                    ),
+                );
+                self.highlight = Some(key.clone());
+            }
+            client.send(
+                &key,
+                devtools_msg(
+                    "inspectElement",
+                    serde_json::json!({
+                        "id": r.id, "rendererID": r.renderer, "requestID": self.devtools_request,
+                        "path": r.path, "forceFullData": r.force,
+                    }),
+                ),
+            );
+        }
+    }
+
+    /// Whether the tab has a detail pane to focus.
+    fn has_detail(&self) -> bool {
+        self.tab != Tab::Perf && !self.rows().is_empty()
+    }
+
+    /// Tab (`back`: Shift-Tab): move focus from the list to the detail pane or
+    /// back. False when it would move past them, so the dashboard focuses its
+    /// next pane.
+    pub fn next_pane(&mut self, back: bool) -> bool {
+        let to_detail = match (self.detail, back) {
+            (false, false) if self.has_detail() => true,
+            (true, true) => false,
+            _ => return false,
+        };
+        self.visual = None;
+        self.detail = to_detail;
+        if to_detail {
+            self.detail_cursor = self.detail_scroll;
+        }
+        true
+    }
+
+    /// Focus the list, or (`back`, Shift-Tab coming from the dashboard's next
+    /// pane) the detail pane.
+    pub fn enter_pane(&mut self, back: bool) {
+        self.visual = None;
+        self.detail = back && self.has_detail();
+        if self.detail {
+            self.detail_cursor = self.detail_scroll;
+        }
+    }
+
+    /// `s`: select a component by tapping it in the app (again to cancel).
+    fn toggle_picking(&mut self) {
+        let Some(key) = self.active.clone() else {
+            return;
+        };
+        let Some(t) = self.active_tree_mut() else {
+            return;
+        };
+        if !t.attached || t.unavailable.is_some() {
+            return;
+        }
+        t.picking = !t.picking;
+        let (event, flash) = if t.picking {
+            (
+                "startInspectingHost",
+                "tap a component in the app (s cancels)",
+            )
+        } else {
+            ("stopInspectingHost", "stopped selecting in the app")
+        };
+        let payload = if t.picking {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!(false)
+        };
+        if t.picking {
+            // Repair React Native's overlay first, if it stopped listening.
+            let check = "(h => h && h.__signalboxPickCheck && h.__signalboxPickCheck())(__REACT_DEVTOOLS_GLOBAL_HOOK__)";
+            self.outbox.push((key.clone(), ConnCmd::Eval(check.into())));
+        }
+        self.outbox.push((key, devtools_msg(event, payload)));
+        self.flash = Some(flash.into());
+    }
+
+    /// The prop on the detail pane's cursor line, if it shows one (any depth:
+    /// `style.0.color`).
+    fn prop_at_cursor(&self) -> Option<Vec<serde_json::Value>> {
+        let line = self.detail_source_line(self.detail_cursor)?;
+        let t = self.active_tree().filter(|t| t.attached)?;
+        t.prop_at(line).filter(|p| !p.is_empty())
+    }
+
+    /// Start typing an edit of the prop at `path`.
+    fn start_edit(&mut self, path: &[serde_json::Value]) {
+        if let Some(t) = self.active_tree() {
+            self.input = t.edit_prefill(path);
+            self.mode = Mode::Edit;
+        }
+    }
+
+    /// The unwrapped detail line that wrapped line `wrapped` belongs to.
+    fn detail_source_line(&self, wrapped: usize) -> Option<usize> {
+        let mut seen = 0;
+        for (i, l) in self.detail_source().iter().enumerate() {
+            seen += wrap(l, self.detail_width.max(1)).len();
+            if wrapped < seen {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Enter on the edit prompt: override the prop. The app keeps it through
+    /// re-renders, until it's put back to the value it had.
+    fn apply_edit(&mut self) {
+        let Some(key) = self.active.clone() else {
+            return;
+        };
+        let Some((path, value)) = parse_edit(&self.input) else {
+            self.flash = Some("type path = value, e.g. children = \"Hi\"".into());
+            return;
+        };
+        let Some(t) = self.active_tree_mut() else {
+            return;
+        };
+        let Some((id, renderer)) = t.edit_target() else {
+            return;
+        };
+        let kept = t.edited(id, &path, &value);
+        let edit = devtools_msg(
+            "overrideValueAtPath",
+            serde_json::json!({
+                "type": "props", "id": id, "rendererID": renderer,
+                "hookID": null, "path": path, "value": value,
+            }),
+        );
+        self.outbox.push((key.clone(), edit));
+        if !kept {
+            let path = serde_json::to_string(&path).unwrap_or_default();
+            let unpin = format!(
+                "(h => h && h.unpin({id}, {path}))(__REACT_DEVTOOLS_GLOBAL_HOOK__.__signalboxPins)"
+            );
+            self.outbox.push((key, ConnCmd::Eval(unpin)));
+        }
+    }
+
+    /// `h`/`l`/`u` in the tree. Returns whether the key was one of them.
+    fn tree_key(&mut self, code: KeyCode) -> bool {
+        let Some(t) = self.active_tree_mut() else {
+            return false;
+        };
+        let Some(id) = t.selected else {
+            return matches!(
+                code,
+                KeyCode::Char('h' | 'l' | 'u') | KeyCode::Left | KeyCode::Right
+            );
+        };
+        let target = match code {
+            // Fold, or go to the parent of what's already folded (or a leaf).
+            KeyCode::Char('h') | KeyCode::Left => {
+                if t.has_children(id) && !t.is_collapsed(id) {
+                    t.set_collapsed(id, true);
+                    None
+                } else {
+                    t.parent(id)
+                }
+            }
+            KeyCode::Char('l') | KeyCode::Right => {
+                if t.is_collapsed(id) {
+                    t.set_collapsed(id, false);
+                    None
+                } else {
+                    t.first_child(id)
+                }
+            }
+            KeyCode::Char('u') => t.parent(id),
+            _ => return false,
+        };
+        if let Some(target) = target {
+            t.reveal(target);
+        }
+        self.anchor_comp_cursor();
+        true
+    }
+}
+
+fn devtools_msg(event: &str, payload: serde_json::Value) -> ConnCmd {
+    ConnCmd::Devtools {
+        event: event.into(),
+        payload,
     }
 }
 
@@ -547,8 +1236,24 @@ fn pad(s: &str, width: usize) -> String {
 }
 
 /// Background for rows/lines inside a visual selection range.
+/// Whether the list and the detail pane both fit side by side.
+fn split(cols: usize) -> bool {
+    cols >= MIN_SPLIT
+}
+
+fn list_width(cols: usize) -> usize {
+    (cols as f64 * 0.45) as usize
+}
+
+/// The list's cursor row while the detail pane has focus.
+fn unfocused_cursor() -> Style {
+    Style::default().bg(Color::Rgb(67, 76, 94))
+}
+
 fn sel_style() -> Style {
-    Style::default().bg(Color::Rgb(38, 79, 120)).fg(Color::White)
+    Style::default()
+        .bg(Color::Rgb(38, 79, 120))
+        .fg(Color::White)
 }
 
 fn in_range(range: Option<(usize, usize)>, i: usize) -> bool {
@@ -575,7 +1280,10 @@ fn row_line(text: &str, width: usize, base: Style, search: &str, current: bool) 
     let lchars: Vec<char> = lower.chars().collect();
     let nchars: Vec<char> = needle.chars().collect();
     while i < bytes.len() {
-        if !nchars.is_empty() && i + nchars.len() <= lchars.len() && lchars[i..i + nchars.len()] == nchars[..] {
+        if !nchars.is_empty()
+            && i + nchars.len() <= lchars.len()
+            && lchars[i..i + nchars.len()] == nchars[..]
+        {
             let m: String = bytes[i..i + nchars.len()].iter().collect();
             spans.push(Span::styled(m, hl));
             i += nchars.len();
@@ -583,7 +1291,11 @@ fn row_line(text: &str, width: usize, base: Style, search: &str, current: bool) 
             // accumulate a run of non-match
             let start = i;
             i += 1;
-            while i < bytes.len() && !(i + nchars.len() <= lchars.len() && !nchars.is_empty() && lchars[i..i + nchars.len()] == nchars[..]) {
+            while i < bytes.len()
+                && !(i + nchars.len() <= lchars.len()
+                    && !nchars.is_empty()
+                    && lchars[i..i + nchars.len()] == nchars[..])
+            {
                 i += 1;
             }
             let run: String = bytes[start..i].iter().collect();
@@ -597,31 +1309,62 @@ fn perf_lines(view: &RnView, h: usize) -> Vec<Line<'static>> {
     let d = view.active.as_ref().and_then(|k| view.devices.get(k));
     let mut out: Vec<Line> = vec![Line::raw(""), Line::raw("  JS thread")];
     match d.and_then(|d| d.perf.fps) {
-        None => out.push(Line::styled("    FPS  — (measuring…)", Style::default().fg(Color::DarkGray))),
+        None => out.push(Line::styled(
+            "    FPS  — (measuring…)",
+            Style::default().fg(Color::DarkGray),
+        )),
         Some(fps) => {
             let width = 30usize;
             let filled = ((fps.min(60) as f64 / 60.0) * width as f64).round() as usize;
-            let bar = format!("{}{}", "█".repeat(filled), "░".repeat(width.saturating_sub(filled)));
-            let color = if fps >= 50 { Color::Green } else if fps >= 30 { Color::Yellow } else { Color::Red };
-            out.push(Line::styled(format!("    FPS  {fps:>2} / 60   {bar}"), Style::default().fg(color)));
+            let bar = format!(
+                "{}{}",
+                "█".repeat(filled),
+                "░".repeat(width.saturating_sub(filled))
+            );
+            let color = if fps >= 50 {
+                Color::Green
+            } else if fps >= 30 {
+                Color::Yellow
+            } else {
+                Color::Red
+            };
+            out.push(Line::styled(
+                format!("    FPS  {fps:>2} / 60   {bar}"),
+                Style::default().fg(color),
+            ));
         }
     }
     if let Some(d) = d {
         if !d.perf.history.is_empty() {
             let spark = "▁▂▃▄▅▆▇█";
             let chars: Vec<char> = spark.chars().collect();
-            let s: String = d.perf.history.iter().map(|v| chars[((*v as f64 / 60.0) * 7.0).round().clamp(0.0, 7.0) as usize]).collect();
-            out.push(Line::raw(format!("    last {}s  {s}", d.perf.history.len())));
+            let s: String = d
+                .perf
+                .history
+                .iter()
+                .map(|v| chars[((*v as f64 / 60.0) * 7.0).round().clamp(0.0, 7.0) as usize])
+                .collect();
+            out.push(Line::raw(format!(
+                "    last {}s  {s}",
+                d.perf.history.len()
+            )));
         }
         out.push(Line::raw(""));
         out.push(Line::raw("  Memory (JS heap)"));
         match d.perf.heap_used {
             Some(u) => {
                 let used = format!("{:.1} MB", u as f64 / 1048576.0);
-                let total = d.perf.heap_total.map(|t| format!(" / {:.1} MB", t as f64 / 1048576.0)).unwrap_or_default();
+                let total = d
+                    .perf
+                    .heap_total
+                    .map(|t| format!(" / {:.1} MB", t as f64 / 1048576.0))
+                    .unwrap_or_default();
                 out.push(Line::raw(format!("    used {used}{total}")));
             }
-            None => out.push(Line::styled("    not reported by this runtime", Style::default().fg(Color::DarkGray))),
+            None => out.push(Line::styled(
+                "    not reported by this runtime",
+                Style::default().fg(Color::DarkGray),
+            )),
         }
     }
     out.push(Line::raw(""));
@@ -644,7 +1387,11 @@ fn render_view(view: &mut RnView, frame: &mut Frame, area: Rect) {
     let is_logs = view.tab == Tab::Logs;
     // Record the pane geometry so n/N wrap/scroll match what's drawn.
     view.view_h = h;
-    view.detail_width = if view.maximized { cols } else { cols.saturating_sub(((cols as f64) * 0.45) as usize + 1) };
+    view.detail_width = if split(cols) {
+        cols.saturating_sub(list_width(cols) + 1)
+    } else {
+        cols
+    };
 
     let d = view.active.as_ref().and_then(|k| view.devices.get(k));
     let who = view.active.clone().unwrap_or_else(|| "…".into());
@@ -657,10 +1404,26 @@ fn render_view(view: &mut RnView, frame: &mut Frame, area: Rect) {
     let logs_n = d.map(|d| d.logs.len()).unwrap_or(0);
     let net_n = d.map(|d| d.net.len()).unwrap_or(0);
     let tabbar = {
-        let lbl = |t: Tab, s: String| if view.tab == t { format!("[{s}]") } else { format!(" {s} ") };
-        format!("{} {} {}", lbl(Tab::Logs, format!("Logs ({logs_n})")), lbl(Tab::Network, format!("Network ({net_n})")), lbl(Tab::Perf, "Perf".into()))
+        let lbl = |t: Tab, s: String| {
+            if view.tab == t {
+                format!("[{s}]")
+            } else {
+                format!(" {s} ")
+            }
+        };
+        format!(
+            "{} {} {} {}",
+            lbl(Tab::Logs, format!("Logs ({logs_n})")),
+            lbl(Tab::Network, format!("Network ({net_n})")),
+            lbl(Tab::Perf, "Perf".into()),
+            lbl(Tab::Components, "Components".into())
+        )
     };
-    let restart = if view.clear_on_restart { "clears logs on restart" } else { "keeps logs on restart" };
+    let restart = if view.clear_on_restart {
+        "clears logs on reload"
+    } else {
+        "keeps logs on reload"
+    };
     let mut net_filters = String::new();
     if !is_logs && (view.errors_only || view.method_idx != 0) {
         let mut parts = Vec::new();
@@ -672,31 +1435,73 @@ fn render_view(view: &mut RnView, frame: &mut Frame, area: Rect) {
         }
         net_filters = format!(" · {}", parts.join("+"));
     }
-    let filter_str = if view.filter.is_empty() { String::new() } else { format!(" · filter:\"{}\"", view.filter) };
+    let filter_str = if view.filter.is_empty() {
+        String::new()
+    } else {
+        format!(" · filter:\"{}\"", view.filter)
+    };
     // App/device engine metadata for the active target (e.g. "Hermes").
-    let meta = view.targets.iter().find(|t| Some(&t.key) == view.active.as_ref()).and_then(|t| t.meta.clone());
+    let meta = view
+        .targets
+        .iter()
+        .find(|t| Some(&t.key) == view.active.as_ref())
+        .and_then(|t| t.meta.clone());
     let meta_str = meta.map(|m| format!(" · {m}")).unwrap_or_default();
     // While paused at a breakpoint the top bar becomes the debugger banner;
     // otherwise it's the normal status/tab line.
     let paused = d.and_then(|d| d.paused.as_ref());
     let head = match paused {
-        Some(p) => format!(" ⏸ PAUSED {}:{} — F5 continue · F10 over · F11 into · ⇧F11 out · F6 pause", p.file, p.line),
-        None => format!(" {who} · {status}{meta_str}{filter_str}{net_filters} · {restart}   {tabbar}"),
+        Some(p) => format!(
+            " ⏸ PAUSED {}:{} — F5 continue · F10 over · F11 into · ⇧F11 out · F6 pause",
+            p.file, p.line
+        ),
+        // Autoscroll state (space toggles it, like every scrollable list).
+        None => format!(
+            " {who} · {status}{meta_str}{filter_str}{net_filters} · {restart}{}   {tabbar}",
+            if view.follow || view.tab == Tab::Components {
+                ""
+            } else {
+                " · paused"
+            }
+        ),
     };
     let head_style = if paused.is_some() {
-        Style::default().bg(Color::Rgb(191, 97, 106)).fg(Color::White).add_modifier(Modifier::BOLD)
+        Style::default()
+            .bg(Color::Rgb(191, 97, 106))
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
     } else {
         bar_style()
     };
 
     // Blank the key footer when another pane has focus (embedded in the dashboard).
-    let foot = if view.focused { footer(view, is_logs) } else { String::new() };
-    let foot_style = if view.focused { bar_style() } else { Style::default() };
+    let foot = if view.focused {
+        footer(view, is_logs)
+    } else {
+        String::new()
+    };
+    let foot_style = if view.focused {
+        bar_style()
+    } else {
+        Style::default()
+    };
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::styled(pad(&head, cols), head_style));
     if has_bar {
-        let db = format!(" Devices: {}", view.targets.iter().enumerate().map(|(i, t)| if Some(&t.key) == view.active.as_ref() { format!("[{}:{}]", i + 1, t.label) } else { format!(" {}:{} ", i + 1, t.label) }).collect::<Vec<_>>().join(" "));
+        let db = format!(
+            " Devices: {}",
+            view.targets
+                .iter()
+                .enumerate()
+                .map(|(i, t)| if Some(&t.key) == view.active.as_ref() {
+                    format!("[{}:{}]", i + 1, t.label)
+                } else {
+                    format!(" {}:{} ", i + 1, t.label)
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
         lines.push(Line::styled(pad(&db, cols), bar_style()));
     }
 
@@ -717,53 +1522,86 @@ fn render_body(view: &RnView, cols: usize, h: usize, d: Option<&Device>) -> Vec<
     }
     let rows = view.rows();
     let len = rows.len();
-    if view.tab == Tab::Network && d.map(|d| !d.network_supported && d.net.is_empty()).unwrap_or(false) {
-        let mut out = vec![Line::styled(" Network isn’t exposed over CDP by this React Native version.", Style::default().fg(Color::Yellow))];
+    if view.tab == Tab::Components && len == 0 {
+        let t = d.map(|d| &d.comp);
+        let msg = match t {
+            None => " No app connected to Metro.".to_string(),
+            Some(t) if t.unavailable.is_some() => format!(" {}.", t.unavailable.as_deref().unwrap_or("")),
+            Some(t) if t.error.is_some() => format!(
+                " Couldn't read the component tree ({}); this React DevTools version may be unsupported.",
+                t.error.as_deref().unwrap_or("")
+            ),
+            Some(_) if !view.filter.is_empty() => " No component matches the filter.".to_string(),
+            Some(t) if t.attached => " Waiting for the component tree…".to_string(),
+            Some(_) => " Connecting to the app's React DevTools…".to_string(),
+        };
+        let mut out = vec![Line::styled(msg, Style::default().fg(Color::Yellow))];
         while out.len() < h {
             out.push(Line::raw(""));
         }
         return out;
     }
-    let eff_sel = if view.follow { len.saturating_sub(1) } else { view.sel[view.tab_idx()].min(len.saturating_sub(1)) };
-    // Visual-select range over list rows (when the list is the active cursor).
-    let list_vis = view.visual.map(|a| (a.min(eff_sel), a.max(eff_sel)));
-
-    if view.detail && len > 0 {
-        let dl = view.detail_wrapped();
-        let d_start = view.detail_scroll.min(dl.len().saturating_sub(h));
-        if view.maximized {
-            // Visual-select range over preview lines, cursor = detail_cursor.
-            let cursor = view.detail_cursor.min(dl.len().saturating_sub(1));
-            let prev_vis = view.visual.map(|a| (a.min(cursor), a.max(cursor)));
-            return (0..h)
-                .map(|i| {
-                    let abs = d_start + i;
-                    match dl.get(abs) {
-                        Some(l) => {
-                            let base = if abs == cursor {
-                                Style::default().add_modifier(Modifier::REVERSED)
-                            } else if in_range(prev_vis, abs) {
-                                sel_style()
-                            } else {
-                                Style::default()
-                            };
-                            row_line(l, cols, base, &view.search, Some(abs) == view.detail_hit)
-                        }
-                        None => Line::raw(""),
-                    }
-                })
-                .collect();
+    if view.tab == Tab::Network
+        && d.map(|d| !d.network_supported && d.net.is_empty())
+            .unwrap_or(false)
+    {
+        let mut out = vec![Line::styled(
+            " Network isn’t exposed over CDP by this React Native version.",
+            Style::default().fg(Color::Yellow),
+        )];
+        while out.len() < h {
+            out.push(Line::raw(""));
         }
-        // split: list | detail
+        return out;
+    }
+    let eff_sel = view.eff_sel(len);
+    // Visual-select range over list rows — only when the list is the active
+    // cursor (no detail panel). With a panel open, visual targets the panel.
+    let list_vis = if view.detail {
+        None
+    } else {
+        view.visual.map(|a| (a.min(eff_sel), a.max(eff_sel)))
+    };
+
+    // The detail pane: its cursor only while it has focus.
+    let detail_line = |dl: &[String], i: usize, width: usize| -> Line<'static> {
+        let abs = view.detail_scroll.min(dl.len().saturating_sub(h)) + i;
+        let cursor = view.detail_cursor.min(dl.len().saturating_sub(1));
+        let vis = view.visual.map(|a| (a.min(cursor), a.max(cursor)));
+        let style = if !view.detail {
+            Style::default()
+        } else if abs == cursor {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else if in_range(vis, abs) {
+            sel_style()
+        } else {
+            Style::default()
+        };
+        let text = dl.get(abs).cloned().unwrap_or_default();
+        row_line(
+            &text,
+            width,
+            style,
+            &view.search,
+            Some(abs) == view.detail_hit,
+        )
+    };
+    if len > 0 && view.tab != Tab::Perf && (view.detail || split(cols)) {
+        let dl = view.detail_wrapped();
+        if !split(cols) {
+            return (0..h).map(|i| detail_line(&dl, i, cols)).collect();
+        }
+        let left_w = list_width(cols);
         let right_w = view.detail_width;
-        let left_w = cols.saturating_sub(right_w + 1);
         let list_start = eff_sel.saturating_sub(h / 2).min(len.saturating_sub(h));
         return (0..h)
             .map(|i| {
                 let idx = list_start + i;
                 let mut spans: Vec<Span> = Vec::new();
                 if let Some((text, err, level)) = rows.get(idx) {
-                    let base = if idx == eff_sel {
+                    let base = if idx == eff_sel && view.detail {
+                        unfocused_cursor()
+                    } else if idx == eff_sel {
                         Style::default().add_modifier(Modifier::REVERSED)
                     } else if in_range(list_vis, idx) {
                         sel_style()
@@ -778,17 +1616,18 @@ fn render_body(view: &RnView, cols: usize, h: usize, d: Option<&Device>) -> Vec<
                     spans.push(Span::raw(" ".repeat(left_w)));
                 }
                 spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
-                let abs = d_start + i;
-                let dline = dl.get(abs).cloned().unwrap_or_default();
-                let dl_line = row_line(&dline, right_w, Style::default(), &view.search, Some(abs) == view.detail_hit);
-                spans.extend(dl_line.spans);
+                spans.extend(detail_line(&dl, i, right_w).spans);
                 Line::from(spans)
             })
             .collect();
     }
 
     // full list
-    let start = if view.follow { len.saturating_sub(h) } else { eff_sel.saturating_sub(h / 2).min(len.saturating_sub(h)) };
+    let start = if view.following() {
+        len.saturating_sub(h)
+    } else {
+        eff_sel.saturating_sub(h / 2).min(len.saturating_sub(h))
+    };
     (0..h)
         .map(|i| {
             let idx = start + i;
@@ -816,30 +1655,69 @@ fn footer(view: &RnView, is_logs: bool) -> String {
     match view.mode {
         Mode::Search => format!("search: {}▏", view.input),
         Mode::Filter => format!("filter: {}▏", view.input),
+        Mode::Edit => format!("edit prop (path = value · ⏎ apply · esc): {}▏", view.input),
         Mode::Normal => {
+            // Standalone only: the dashboard shows R/q as global keys.
+            let (reload, quit) = if view.embedded {
+                ("", "")
+            } else {
+                (" · R reload", " · q quit")
+            };
+            // Device switching only matters with more than one connected.
+            let devs = if view.targets.len() > 1 {
+                " 1-9 devices ·"
+            } else {
+                ""
+            };
             if let Some(f) = &view.flash {
                 return format!(" {f}");
             }
             if view.visual.is_some() {
-                let what = if view.maximized { "lines" } else { "rows" };
-                return format!(" VISUAL ({what}) · jk extend · y yank · V/esc cancel");
+                let what = if view.detail { "lines" } else { "rows" };
+                return format!(" VISUAL ({what}) · y yank · V/esc cancel");
             }
             if view.tab == Tab::Perf {
-                return " [ ] tabs · 1-9 dev · live JS FPS + heap · R reload · q quit".into();
+                return format!("{devs} live JS FPS + heap{reload}{quit}");
+            }
+            if view.tab == Tab::Components {
+                let picking = view.active_tree().is_some_and(|t| t.picking);
+                if picking {
+                    return " tap a component in the app · s cancel".into();
+                }
+                if view.detail {
+                    return format!("{devs} ⏎ edit prop / open file · esc tree · s select in app · o used · O defined · {{}} sect · / search{reload}{quit}");
+                }
+                return format!("{devs} s select in app · h/l fold · u parent · o used · O defined · ⏎ props · / search · f filter{reload}{quit}");
             }
             if view.detail {
-                let nn = if view.search.is_empty() { "" } else { " · n/N" };
-                let z = if view.maximized { "z split" } else { "z max" };
-                let copy = if is_logs { "" } else { " · c curl" };
-                let vis = if view.maximized { " · V select" } else { "" };
-                let open = if view.maximized { " · o nvim" } else { "" };
-                return format!(" ⏎ close · {z} · jk {} · JK scroll · / search{nn}{vis} · y copy{copy}{open} · q quit", if view.maximized { "move" } else { "list" });
+                let nn = if view.search.is_empty() {
+                    ""
+                } else {
+                    " · n/N"
+                };
+                let copy = if is_logs {
+                    " · F frames"
+                } else {
+                    " · c curl"
+                };
+                return format!(" ⏎ open file / copy line · esc list · {{}} sect · / search{nn} · V select · y copy all{copy}{quit}");
             }
-            let nn = if view.search.is_empty() { "" } else { " · n/N" };
-            let scroll = if view.follow { "on" } else { "off" };
-            let netf = if is_logs { "" } else { " · e errors · m method" };
-            let restart = if view.clear_on_restart { "clear" } else { "keep" };
-            format!(" [ ] tabs · 1-9 dev · jk/g/G move · / search{nn} · f filter · ⏎ preview · z max · V select · y copy{netf} · space/a scroll:{scroll} · c clear · p restart:{restart} · R reload · q quit")
+            let nn = if view.search.is_empty() {
+                ""
+            } else {
+                " · n/N"
+            };
+            let netf = if is_logs {
+                ""
+            } else {
+                " · e errors · m method"
+            };
+            let restart = if view.clear_on_restart {
+                "clear"
+            } else {
+                "keep"
+            };
+            format!("{devs} / search{nn} · f filter · ⏎ detail · V select · y copy{netf} · c clear · p reload:{restart}{reload}{quit}")
         }
     }
 }
@@ -848,7 +1726,12 @@ fn footer(view: &RnView, is_logs: bool) -> String {
 
 fn match_indexes(view: &RnView) -> Vec<usize> {
     let n = view.search.to_lowercase();
-    view.rows().iter().enumerate().filter(|(_, (t, _, _))| t.to_lowercase().contains(&n)).map(|(i, _)| i).collect()
+    view.rows()
+        .iter()
+        .enumerate()
+        .filter(|(_, (t, _, _))| t.to_lowercase().contains(&n))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 fn jump(view: &mut RnView, dir: i32) {
@@ -860,8 +1743,20 @@ fn jump(view: &mut RnView, dir: i32) {
         return;
     }
     let n = view.rows().len();
-    let base = if view.follow { n.saturating_sub(1) } else { view.sel[view.tab_idx()] };
-    let next = if dir == 1 { hits.iter().find(|&&i| i > base).copied().unwrap_or(hits[0]) } else { hits.iter().rev().find(|&&i| i < base).copied().unwrap_or(*hits.last().unwrap()) };
+    let base = if view.follow {
+        n.saturating_sub(1)
+    } else {
+        view.sel[view.tab_idx()]
+    };
+    let next = if dir == 1 {
+        hits.iter().find(|&&i| i > base).copied().unwrap_or(hits[0])
+    } else {
+        hits.iter()
+            .rev()
+            .find(|&&i| i < base)
+            .copied()
+            .unwrap_or(*hits.last().unwrap())
+    };
     view.follow = false;
     view.sel[view.tab_idx()] = next;
 }
@@ -878,9 +1773,17 @@ fn jump_first(view: &mut RnView) {
     if hits.is_empty() {
         return;
     }
-    let base = if view.follow { 0 } else { view.sel[view.tab_idx()] };
+    let base = if view.follow {
+        0
+    } else {
+        view.sel[view.tab_idx()]
+    };
     view.follow = false;
-    view.sel[view.tab_idx()] = hits.iter().find(|&&i| i >= base).copied().unwrap_or(hits[0]);
+    view.sel[view.tab_idx()] = hits
+        .iter()
+        .find(|&&i| i >= base)
+        .copied()
+        .unwrap_or(hits[0]);
 }
 
 const DETAIL_CONTEXT: usize = 3;
@@ -890,7 +1793,12 @@ fn detail_matches(view: &RnView) -> Vec<usize> {
         return Vec::new();
     }
     let n = view.search.to_lowercase();
-    view.detail_wrapped().iter().enumerate().filter(|(_, l)| l.to_lowercase().contains(&n)).map(|(i, _)| i).collect()
+    view.detail_wrapped()
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.to_lowercase().contains(&n))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 fn detail_jump(view: &mut RnView, dir: i32) {
@@ -902,7 +1810,11 @@ fn detail_jump(view: &mut RnView, dir: i32) {
     let next = if dir == 1 {
         hits.iter().find(|&&i| i > base).copied().unwrap_or(hits[0])
     } else {
-        hits.iter().rev().find(|&&i| i < base).copied().unwrap_or(*hits.last().unwrap())
+        hits.iter()
+            .rev()
+            .find(|&&i| i < base)
+            .copied()
+            .unwrap_or(*hits.last().unwrap())
     };
     view.detail_hit = Some(next);
     view.detail_scroll = next.saturating_sub(DETAIL_CONTEXT);
@@ -914,7 +1826,11 @@ fn detail_jump_first(view: &mut RnView) {
         return;
     }
     let from = view.detail_hit.unwrap_or(view.detail_scroll);
-    let next = hits.iter().find(|&&i| i >= from).copied().unwrap_or(hits[0]);
+    let next = hits
+        .iter()
+        .find(|&&i| i >= from)
+        .copied()
+        .unwrap_or(hits[0]);
     view.detail_hit = Some(next);
     view.detail_scroll = next.saturating_sub(DETAIL_CONTEXT);
 }
@@ -925,7 +1841,11 @@ fn copy_selection(view: &mut RnView) {
         return;
     }
     let text = lines.join("\n");
-    view.flash = Some(if copy_to_clipboard(&text) { format!("copied ({} chars)", text.len()) } else { "copy failed".into() });
+    view.flash = Some(if copy_to_clipboard(&text) {
+        format!("copied ({} chars)", text.len())
+    } else {
+        "copy failed".into()
+    });
 }
 
 /// Copy `text` to the clipboard, flashing how many lines were yanked.
@@ -934,7 +1854,11 @@ fn yank(view: &mut RnView, text: String) {
         return;
     }
     let n = text.lines().count();
-    view.flash = Some(if copy_to_clipboard(&text) { format!("yanked {n} line{}", if n == 1 { "" } else { "s" }) } else { "copy failed".into() });
+    view.flash = Some(if copy_to_clipboard(&text) {
+        format!("yanked {n} line{}", if n == 1 { "" } else { "s" })
+    } else {
+        "copy failed".into()
+    });
 }
 
 /// Scroll the maximized preview so `detail_cursor` stays on screen.
@@ -947,6 +1871,46 @@ fn keep_cursor_visible(view: &mut RnView) {
     }
 }
 
+/// Move the preview cursor to the next/prev section header (`── … ──`) — the
+/// Stack divider in logs, or the headers/body dividers in a network entry.
+fn jump_section(view: &mut RnView, dir: i32) {
+    let lines = view.detail_wrapped();
+    let is_header = |s: &str| s.trim_start().starts_with("──");
+    let cur = view.detail_cursor;
+    let target = if dir > 0 {
+        lines
+            .iter()
+            .enumerate()
+            .skip(cur + 1)
+            .find(|(_, l)| is_header(l))
+            .map(|(i, _)| i)
+    } else {
+        // Previous header, or the top of the panel if there's none above.
+        lines
+            .iter()
+            .enumerate()
+            .take(cur)
+            .rfind(|(_, l)| is_header(l))
+            .map(|(i, _)| i)
+            .or(Some(0))
+    };
+    if let Some(i) = target {
+        view.detail_cursor = i;
+        // Pin the header to the top so its content is visible below it
+        // (clamped so the last page doesn't scroll past the end).
+        view.detail_scroll = i.min(lines.len().saturating_sub(view.view_h.max(1)));
+        view.detail_hit = None;
+    }
+}
+
+/// Reset the preview cursor/scroll to the top — call when the side-by-side list
+/// selection changes so the panel starts fresh on the new entry.
+fn reset_detail_cursor(view: &mut RnView) {
+    view.detail_cursor = 0;
+    view.detail_scroll = 0;
+    view.detail_hit = None;
+}
+
 /// Yank the current visual selection (preview lines when maximized, else list
 /// rows). Returns false if there was no active selection.
 fn yank_visual(view: &mut RnView) -> bool {
@@ -954,7 +1918,7 @@ fn yank_visual(view: &mut RnView) -> bool {
         Some(a) => a,
         None => return false,
     };
-    let text = if view.maximized {
+    let text = if view.detail {
         let lines = view.detail_wrapped();
         let cursor = view.detail_cursor.min(lines.len().saturating_sub(1));
         let (lo, hi) = (anchor.min(cursor), anchor.max(cursor));
@@ -965,7 +1929,10 @@ fn yank_visual(view: &mut RnView) -> bool {
         let len = view.rows().len();
         let eff = view.eff_sel(len);
         let (lo, hi) = (anchor.min(eff), anchor.max(eff).min(len.saturating_sub(1)));
-        (lo..=hi).map(|i| view.row_detail(i).join("\n")).collect::<Vec<_>>().join("\n\n")
+        (lo..=hi)
+            .map(|i| view.row_detail(i).join("\n"))
+            .collect::<Vec<_>>()
+            .join("\n\n")
     };
     yank(view, text);
     view.visual = None;
@@ -982,11 +1949,23 @@ fn copy_curl(view: &mut RnView) {
     };
     let method = METHODS[view.method_idx];
     let f = view.filter.to_lowercase();
-    let list: Vec<&NetRecord> = d.net.iter().filter(|r| (f.is_empty() || net_summary(r).to_lowercase().contains(&f)) && (!view.errors_only || net_error(r)) && (method == "ALL" || r.method.to_uppercase() == method)).collect();
+    let list: Vec<&NetRecord> = d
+        .net
+        .iter()
+        .filter(|r| {
+            (f.is_empty() || net_summary(r).to_lowercase().contains(&f))
+                && (!view.errors_only || net_error(r))
+                && (method == "ALL" || r.method.to_uppercase() == method)
+        })
+        .collect();
     let sel = view.sel[view.tab_idx()].min(list.len().saturating_sub(1));
     if let Some(rec) = list.get(sel) {
         let curl = to_curl(rec);
-        view.flash = Some(if copy_to_clipboard(&curl) { "copied curl".into() } else { "copy failed".into() });
+        view.flash = Some(if copy_to_clipboard(&curl) {
+            "copied curl".into()
+        } else {
+            "copy failed".into()
+        });
     }
 }
 
@@ -994,7 +1973,12 @@ fn copy_curl(view: &mut RnView) {
 /// (so continue/step keys are inert when nothing is paused).
 fn send_if_paused(view: &RnView, client: &RnClient, key: &Option<String>, cmd: ConnCmd) {
     if let Some(k) = key {
-        if view.devices.get(k).map(|d| d.paused.is_some()).unwrap_or(false) {
+        if view
+            .devices
+            .get(k)
+            .map(|d| d.paused.is_some())
+            .unwrap_or(false)
+        {
             client.send(k, cmd);
         }
     }
@@ -1038,10 +2022,77 @@ fn resolve_path(file: &str, root: Option<&str>) -> String {
     }
 }
 
+/// The unwrapped logical detail line under the cursor, so a frame split across
+/// two visual rows (narrow side-by-side panel) still parses.
+fn source_line_at_cursor(view: &RnView) -> Option<String> {
+    let src = view.detail_source();
+    let width = view.detail_width.max(1);
+    let mut acc = 0;
+    for line in &src {
+        let n = wrap(line, width).len().max(1);
+        if view.detail_cursor < acc + n {
+            return Some(line.clone());
+        }
+        acc += n;
+    }
+    src.last().cloned()
+}
+
+/// `o`/`O` in the Components tab: open where the selected component is used
+/// (`used`) or defined.
+fn open_component_source(view: &mut RnView, used: bool) {
+    let src = view
+        .active_tree()
+        .and_then(|t| if used { t.usage() } else { t.source() })
+        .map(String::from);
+    let Some((file, line_no)) = src
+        .as_deref()
+        .and_then(|s| parse_location(&format!("({s})")))
+    else {
+        view.flash = Some(if used {
+            "can't tell where this component is used".into()
+        } else {
+            "no source file for this component".into()
+        });
+        return;
+    };
+    let path = resolve_path(&file, view.root.as_deref());
+    match open_in_nvim(&path, line_no) {
+        Ok(()) => view.flash = Some(format!("opening {file}:{line_no}")),
+        Err(e) => view.flash = Some(e),
+    }
+}
+
+/// Enter in the detail pane: edit the prop on the cursor line, else open its
+/// file:line, else copy the line.
+fn act_on_line(view: &mut RnView) {
+    if view.tab == Tab::Components {
+        if let Some(path) = view.prop_at_cursor() {
+            view.start_edit(&path);
+            return;
+        }
+    }
+    let Some(line) = source_line_at_cursor(view) else {
+        return;
+    };
+    if parse_location(&line).is_some() {
+        open_at_cursor(view);
+        return;
+    }
+    let text = line.trim();
+    if text.is_empty() || text.starts_with("──") {
+        return;
+    }
+    view.flash = Some(if copy_to_clipboard(text) {
+        "copied the line".into()
+    } else {
+        "copy failed".into()
+    });
+}
+
 fn open_at_cursor(view: &mut RnView) {
-    let lines = view.detail_wrapped();
-    let line = match lines.get(view.detail_cursor) {
-        Some(l) => l.clone(),
+    let line = match source_line_at_cursor(view) {
+        Some(l) => l,
         None => return,
     };
     let (file, line_no) = match parse_location(&line) {
@@ -1073,7 +2124,8 @@ fn open_in_nvim(path: &str, line: usize) -> Result<(), String> {
         run(&["select-pane", "-t", &pane]);
         return Ok(());
     }
-    let sock = nvim_socket().ok_or("no running nvim found (start it with --listen, or set NVIM_LISTEN_ADDRESS)")?;
+    let sock = nvim_socket()
+        .ok_or("no running nvim found (start it with --listen, or set NVIM_LISTEN_ADDRESS)")?;
     let keys = format!("<C-\\><C-n>:e +{line} {path}<CR>");
     let ok = Command::new("nvim")
         .args(["--server", &sock, "--remote-send", &keys])
@@ -1089,7 +2141,15 @@ fn open_in_nvim(path: &str, line: usize) -> Result<(), String> {
 
 /// The pane id of an nvim in the current tmux session, if any.
 fn tmux_nvim_pane() -> Option<String> {
-    let out = Command::new("tmux").args(["list-panes", "-s", "-F", "#{pane_id} #{pane_current_command}"]).output().ok()?;
+    let out = Command::new("tmux")
+        .args([
+            "list-panes",
+            "-s",
+            "-F",
+            "#{pane_id} #{pane_current_command}",
+        ])
+        .output()
+        .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     for l in text.lines() {
         let mut parts = l.split_whitespace();
@@ -1151,6 +2211,21 @@ fn nvim_socket() -> Option<String> {
 
 /// Returns true to quit.
 fn handle_key(view: &mut RnView, key: KeyEvent, client: &RnClient) -> bool {
+    if view.mode == Mode::Edit {
+        match key.code {
+            KeyCode::Enter => {
+                view.mode = Mode::Normal;
+                view.apply_edit();
+            }
+            KeyCode::Esc => view.mode = Mode::Normal,
+            KeyCode::Backspace => {
+                view.input.pop();
+            }
+            KeyCode::Char(c) => view.input.push(c),
+            _ => {}
+        }
+        return false;
+    }
     if view.mode != Mode::Normal {
         match key.code {
             KeyCode::Enter => {
@@ -1187,6 +2262,28 @@ fn handle_key(view: &mut RnView, key: KeyEvent, client: &RnClient) -> bool {
     }
 
     view.flash = None;
+    // Where the selected component is used (o) or defined (O), from anywhere.
+    if view.tab == Tab::Components && matches!(key.code, KeyCode::Char('o' | 'O')) {
+        open_component_source(view, key.code == KeyCode::Char('o'));
+        return false;
+    }
+    // Select by tapping works from anywhere in the tab.
+    if view.tab == Tab::Components && key.code == KeyCode::Char('s') {
+        view.toggle_picking();
+        return false;
+    }
+    if view.tab == Tab::Components && !view.detail {
+        match key.code {
+            // The tree has nothing to clear or follow.
+            KeyCode::Char('c' | 'a' | ' ' | 'p')
+                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                return false
+            }
+            code if view.tree_key(code) => return false,
+            _ => {}
+        }
+    }
     let n = view.rows().len();
     let ti = view.tab_idx();
     let h = 20usize; // page size approximation for PgUp/PgDn
@@ -1198,7 +2295,9 @@ fn handle_key(view: &mut RnView, key: KeyEvent, client: &RnClient) -> bool {
         // Debugger stepping (only act while the VM is suspended).
         KeyCode::F(5) => send_if_paused(view, client, &key_active, ConnCmd::Continue),
         KeyCode::F(10) => send_if_paused(view, client, &key_active, ConnCmd::StepOver),
-        KeyCode::F(11) if key.modifiers.contains(KeyModifiers::SHIFT) => send_if_paused(view, client, &key_active, ConnCmd::StepOut),
+        KeyCode::F(11) if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            send_if_paused(view, client, &key_active, ConnCmd::StepOut)
+        }
         KeyCode::F(11) => send_if_paused(view, client, &key_active, ConnCmd::StepInto),
         // Interrupt a running VM (works whether or not already paused).
         KeyCode::F(6) => {
@@ -1207,16 +2306,30 @@ fn handle_key(view: &mut RnView, key: KeyEvent, client: &RnClient) -> bool {
             }
         }
         KeyCode::Char('[') => {
-            view.tab = match view.tab { Tab::Logs => Tab::Perf, Tab::Network => Tab::Logs, Tab::Perf => Tab::Network };
+            view.tab = match view.tab {
+                Tab::Logs => Tab::Components,
+                Tab::Network => Tab::Logs,
+                Tab::Perf => Tab::Network,
+                Tab::Components => Tab::Perf,
+            };
             view.detail = false;
-            view.maximized = false;
             view.visual = None;
         }
         KeyCode::Char(']') => {
-            view.tab = match view.tab { Tab::Logs => Tab::Network, Tab::Network => Tab::Perf, Tab::Perf => Tab::Logs };
+            view.tab = match view.tab {
+                Tab::Logs => Tab::Network,
+                Tab::Network => Tab::Perf,
+                Tab::Perf => Tab::Components,
+                Tab::Components => Tab::Logs,
+            };
             view.detail = false;
-            view.maximized = false;
             view.visual = None;
+        }
+        // Standalone: Tab moves between the list and the detail pane (in the
+        // dashboard, Tab goes through them along with its other panes).
+        KeyCode::Tab | KeyCode::BackTab => {
+            let back = view.detail;
+            view.next_pane(back);
         }
         KeyCode::Char('/') => {
             view.mode = Mode::Search;
@@ -1242,32 +2355,31 @@ fn handle_key(view: &mut RnView, key: KeyEvent, client: &RnClient) -> bool {
                 client.send(k, ConnCmd::DiscardConsole);
             }
         }
-        KeyCode::Char('z') => {
-            view.visual = None;
-            if !view.detail {
-                view.detail = true;
-                view.detail_scroll = 0;
-                view.detail_cursor = 0;
-                view.maximized = true;
-                view.opened_by_max = true;
-            } else if view.maximized {
-                view.maximized = false;
-                if view.opened_by_max {
-                    view.detail = false;
-                    view.opened_by_max = false;
-                }
-            } else {
-                view.maximized = true;
-                view.detail_cursor = view.detail_scroll;
-            }
-        }
         KeyCode::Char('p') => view.clear_on_restart = !view.clear_on_restart,
         // Open the stack frame under the cursor in the already-running nvim.
-        KeyCode::Char('o') if view.detail && view.maximized => open_at_cursor(view),
+        KeyCode::Char('o') if view.detail => open_at_cursor(view),
+        // Jump between detail sections (── Stack ──, Request/Response headers/body …).
+        KeyCode::Char('}') => jump_section(view, 1),
+        KeyCode::Char('{') => jump_section(view, -1),
+        KeyCode::Char('F') if view.tab == Tab::Logs => {
+            view.show_framework = !view.show_framework;
+            view.detail_cursor = view
+                .detail_cursor
+                .min(view.detail_wrapped().len().saturating_sub(1));
+            keep_cursor_visible(view);
+            view.flash = Some(
+                if view.show_framework {
+                    "showing framework frames"
+                } else {
+                    "hiding framework frames"
+                }
+                .into(),
+            );
+        }
         KeyCode::Char('V') => {
             if view.visual.is_some() {
                 view.visual = None;
-            } else if view.maximized {
+            } else if view.detail {
                 view.visual = Some(view.detail_cursor);
             } else {
                 view.follow = false;
@@ -1281,7 +2393,9 @@ fn handle_key(view: &mut RnView, key: KeyEvent, client: &RnClient) -> bool {
         }
         KeyCode::Char('C') => copy_curl(view),
         KeyCode::Char('e') if view.tab == Tab::Network => view.errors_only = !view.errors_only,
-        KeyCode::Char('m') if view.tab == Tab::Network => view.method_idx = (view.method_idx + 1) % METHODS.len(),
+        KeyCode::Char('m') if view.tab == Tab::Network => {
+            view.method_idx = (view.method_idx + 1) % METHODS.len()
+        }
         KeyCode::Char('a') | KeyCode::Char(' ') => {
             view.visual = None;
             view.follow = !view.follow;
@@ -1294,7 +2408,6 @@ fn handle_key(view: &mut RnView, key: KeyEvent, client: &RnClient) -> bool {
             if idx < view.targets.len() {
                 view.active = Some(view.targets[idx].key.clone());
                 view.detail = false;
-                view.maximized = false;
                 view.visual = None;
             }
         }
@@ -1304,27 +2417,26 @@ fn handle_key(view: &mut RnView, key: KeyEvent, client: &RnClient) -> bool {
             }
         }
         KeyCode::Esc if view.visual.is_some() => view.visual = None,
-        KeyCode::Enter | KeyCode::Esc => {
+        KeyCode::Esc => view.detail = false,
+        KeyCode::Enter if view.detail => act_on_line(view),
+        KeyCode::Enter => {
             view.visual = None;
-            if view.detail {
-                view.detail = false;
-                view.maximized = false;
-                view.opened_by_max = false;
-            } else if n > 0 {
-                view.detail = true;
-                view.detail_scroll = 0;
-            }
+            view.next_pane(false);
         }
+        // Scroll the detail pane from the list.
         KeyCode::Char('J') => {
+            let last = view.detail_wrapped().len().saturating_sub(view.view_h);
+            view.detail_scroll = (view.detail_scroll + 1).min(last);
             if view.detail {
-                view.detail_scroll += 1;
-                view.detail_hit = None;
+                view.detail_cursor = view.detail_cursor.max(view.detail_scroll);
             }
         }
         KeyCode::Char('K') => {
+            view.detail_scroll = view.detail_scroll.saturating_sub(1);
             if view.detail {
-                view.detail_scroll = view.detail_scroll.saturating_sub(1);
-                view.detail_hit = None;
+                view.detail_cursor = view
+                    .detail_cursor
+                    .min(view.detail_scroll + view.view_h.max(1) - 1);
             }
         }
         KeyCode::Char('n') => {
@@ -1342,7 +2454,7 @@ fn handle_key(view: &mut RnView, key: KeyEvent, client: &RnClient) -> bool {
             }
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            if view.detail && view.maximized {
+            if view.detail {
                 // Move the preview cursor (drives visual selection); view follows.
                 view.detail_cursor = view.detail_cursor.saturating_sub(1);
                 keep_cursor_visible(view);
@@ -1350,37 +2462,64 @@ fn handle_key(view: &mut RnView, key: KeyEvent, client: &RnClient) -> bool {
             } else {
                 // Start from the row actually shown (the bottom while following),
                 // not the stale sel=0, so the first `k` steps up by one.
-                let cur = if view.follow { n.saturating_sub(1) } else { view.sel[ti] };
+                let cur = if view.following() {
+                    n.saturating_sub(1)
+                } else {
+                    view.sel[ti]
+                };
                 view.follow = false;
                 view.sel[ti] = cur.saturating_sub(1);
+                reset_detail_cursor(view); // new entry previewed → panel back to top
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if view.detail && view.maximized {
+            if view.detail {
                 let last = view.detail_wrapped().len().saturating_sub(1);
                 view.detail_cursor = (view.detail_cursor + 1).min(last);
                 keep_cursor_visible(view);
                 view.detail_hit = None;
             } else {
-                let cur = if view.follow { n.saturating_sub(1) } else { view.sel[ti] };
+                let cur = if view.following() {
+                    n.saturating_sub(1)
+                } else {
+                    view.sel[ti]
+                };
                 let next = (cur + 1).min(n.saturating_sub(1));
                 view.follow = next >= n.saturating_sub(1);
                 view.sel[ti] = next;
+                reset_detail_cursor(view);
             }
         }
+        KeyCode::PageUp if view.detail => {
+            view.detail_cursor = view.detail_cursor.saturating_sub(view.view_h.max(1));
+            keep_cursor_visible(view);
+        }
+        KeyCode::PageDown if view.detail => {
+            let last = view.detail_wrapped().len().saturating_sub(1);
+            view.detail_cursor = (view.detail_cursor + view.view_h.max(1)).min(last);
+            keep_cursor_visible(view);
+        }
         KeyCode::PageUp => {
-            let cur = if view.follow { n.saturating_sub(1) } else { view.sel[ti] };
+            let cur = if view.following() {
+                n.saturating_sub(1)
+            } else {
+                view.sel[ti]
+            };
             view.follow = false;
             view.sel[ti] = cur.saturating_sub(h);
         }
         KeyCode::PageDown => {
-            let cur = if view.follow { n.saturating_sub(1) } else { view.sel[ti] };
+            let cur = if view.following() {
+                n.saturating_sub(1)
+            } else {
+                view.sel[ti]
+            };
             let next = (cur + h).min(n.saturating_sub(1));
             view.follow = next >= n.saturating_sub(1);
             view.sel[ti] = next;
         }
         KeyCode::Char('g') => {
-            if view.detail && view.maximized {
+            if view.detail {
                 view.detail_cursor = 0;
                 keep_cursor_visible(view);
             } else {
@@ -1390,7 +2529,7 @@ fn handle_key(view: &mut RnView, key: KeyEvent, client: &RnClient) -> bool {
             }
         }
         KeyCode::Char('G') => {
-            if view.detail && view.maximized {
+            if view.detail {
                 view.detail_cursor = view.detail_wrapped().len().saturating_sub(1);
                 keep_cursor_visible(view);
             } else {
@@ -1413,4 +2552,487 @@ fn copy_to_clipboard(text: &str) -> bool {
         return child.wait().map(|s| s.success()).unwrap_or(false);
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::mpsc::Receiver;
+
+    const APP: &str = "iPhone 16";
+
+    /// `operations` for Root 1 › App 2 › (Header 3, List 4 › Item 5, Item 6).
+    fn tree_ops() -> serde_json::Value {
+        let mut ops = vec![1, 1];
+        let names = ["App", "Header", "List", "Item"];
+        let mut table = Vec::new();
+        for n in names {
+            table.push(n.len() as i64);
+            table.extend(n.chars().map(|c| c as i64));
+        }
+        ops.push(table.len() as i64);
+        ops.extend(table);
+        ops.extend([1, 1, 11, 0, 0, 1, 1]);
+        ops.extend([1, 2, 5, 1, 0, 1, 0]);
+        ops.extend([1, 3, 5, 2, 2, 2, 0]);
+        ops.extend([1, 4, 5, 2, 2, 3, 0]);
+        ops.extend([1, 5, 5, 4, 4, 4, 0]);
+        ops.extend([1, 6, 5, 4, 4, 4, 0]);
+        json!(ops)
+    }
+
+    /// A view on the Components tab of one connected app, and what it sent.
+    fn components() -> (RnView, RnClient, Receiver<ConnCmd>) {
+        let (client, sent) = RnClient::recording(APP);
+        let mut view = RnView::new(None);
+        view.on_event(RnEvent::Targets(vec![TargetInfo {
+            key: APP.into(),
+            label: APP.into(),
+            meta: None,
+        }]));
+        view.on_event(RnEvent::Status(APP.into(), Status::Connected));
+        view.on_key(KeyEvent::from(KeyCode::Char('[')), &client); // Logs → Components
+        (view, client, sent)
+    }
+
+    fn key(view: &mut RnView, client: &RnClient, code: KeyCode) {
+        view.on_key(KeyEvent::from(code), client);
+    }
+
+    /// The bridge messages sent so far, as "event payload" strings.
+    fn messages(sent: &Receiver<ConnCmd>) -> Vec<String> {
+        sent.try_iter()
+            .map(|c| match c {
+                ConnCmd::DevtoolsAttach => "attach".into(),
+                ConnCmd::DevtoolsDetach => "detach".into(),
+                ConnCmd::Devtools { event, payload } => format!("{event} {payload}"),
+                ConnCmd::Eval(js) => format!("eval {js}"),
+                _ => "other".into(),
+            })
+            .collect()
+    }
+
+    fn row_texts(view: &RnView) -> Vec<String> {
+        view.rows().into_iter().map(|r| r.0).collect()
+    }
+
+    fn selected(view: &RnView) -> Option<i64> {
+        view.active_tree().and_then(|t| t.selected)
+    }
+
+    #[test]
+    fn attaches_only_while_the_tab_is_open() {
+        let (mut view, client, sent) = components();
+        view.tick(&client);
+        view.tick(&client);
+        assert_eq!(messages(&sent), vec!["attach"]);
+        key(&mut view, &client, KeyCode::Char(']')); // back to Logs
+        view.tick(&client);
+        assert_eq!(messages(&sent), vec!["detach"]);
+        key(&mut view, &client, KeyCode::Char('['));
+        view.tick(&client);
+        assert_eq!(messages(&sent), vec!["attach"]);
+        // A reconnect drops the attachment; the next tick attaches again.
+        view.on_event(RnEvent::Status(APP.into(), Status::Disconnected));
+        view.tick(&client);
+        assert!(messages(&sent).is_empty());
+        view.on_event(RnEvent::Status(APP.into(), Status::Connected));
+        view.tick(&client);
+        assert_eq!(messages(&sent), vec!["attach"]);
+    }
+
+    #[test]
+    fn shows_the_tree_and_inspects_the_cursor() {
+        let (mut view, client, sent) = components();
+        view.tick(&client);
+        view.on_event(RnEvent::Devtools(
+            APP.into(),
+            "operations".into(),
+            tree_ops(),
+        ));
+        assert_eq!(
+            row_texts(&view),
+            vec!["▾ App", "   Header", " ▾ List", "    Item", "    Item"]
+        );
+        key(&mut view, &client, KeyCode::Char('j'));
+        assert_eq!(selected(&view), Some(3));
+        messages(&sent);
+        view.tick(&client);
+        let m = messages(&sent);
+        assert!(m[0].starts_with("highlightHostInstance "), "{m:?}");
+        assert!(
+            m[1].contains("\"forceFullData\":true") && m[1].contains("\"id\":3"),
+            "{m:?}"
+        );
+        key(&mut view, &client, KeyCode::Enter);
+        assert_eq!(view.detail_source(), vec!["<Header>  #3", "  inspecting…"]);
+        view.on_event(RnEvent::Devtools(
+            APP.into(),
+            "inspectedElement".into(),
+            json!({"id": 3, "type": "full-data", "value": {"props": {"data": {"title": "Hi"}, "cleaned": []}}}),
+        ));
+        assert_eq!(
+            view.detail_source(),
+            vec!["<Header>  #3", "── Props ──", "  title: \"Hi\""]
+        );
+    }
+
+    #[test]
+    fn folds_and_walks_the_tree() {
+        let (mut view, client, _sent) = components();
+        view.tick(&client);
+        view.on_event(RnEvent::Devtools(
+            APP.into(),
+            "operations".into(),
+            tree_ops(),
+        ));
+        key(&mut view, &client, KeyCode::Char('G')); // the last Item
+        assert_eq!(selected(&view), Some(6));
+        key(&mut view, &client, KeyCode::Char('u'));
+        assert_eq!(selected(&view), Some(4));
+        key(&mut view, &client, KeyCode::Char('h')); // fold List
+        assert_eq!(row_texts(&view), vec!["▾ App", "   Header", " ▸ List"]);
+        assert_eq!(selected(&view), Some(4));
+        key(&mut view, &client, KeyCode::Char('h')); // folded: up to App
+        assert_eq!(selected(&view), Some(2));
+        key(&mut view, &client, KeyCode::Char('l')); // into App's first child
+        assert_eq!(selected(&view), Some(3));
+        key(&mut view, &client, KeyCode::Char('j'));
+        key(&mut view, &client, KeyCode::Char('l')); // unfold List
+        key(&mut view, &client, KeyCode::Char('l')); // into it
+        assert_eq!(selected(&view), Some(5));
+        // The cursor stays on the selected component when the tree changes.
+        view.on_event(RnEvent::Devtools(
+            APP.into(),
+            "operations".into(),
+            json!([1, 1, 0, 2, 1, 3]), // Header unmounts
+        ));
+        assert_eq!(selected(&view), Some(5));
+        assert_eq!(view.eff_sel(view.rows().len()), 2);
+    }
+
+    #[test]
+    fn selects_the_component_tapped_in_the_app() {
+        let (mut view, client, sent) = components();
+        view.tick(&client);
+        view.on_event(RnEvent::Devtools(
+            APP.into(),
+            "operations".into(),
+            tree_ops(),
+        ));
+        key(&mut view, &client, KeyCode::Char('u')); // App
+        key(&mut view, &client, KeyCode::Char('h')); // fold it all
+        assert_eq!(row_texts(&view), vec!["▸ App"]);
+        messages(&sent);
+        key(&mut view, &client, KeyCode::Char('s'));
+        view.tick(&client);
+        assert!(messages(&sent).contains(&"startInspectingHost null".to_string()));
+        view.on_event(RnEvent::Devtools(
+            APP.into(),
+            "selectElement".into(),
+            json!(6),
+        ));
+        assert_eq!(selected(&view), Some(6));
+        assert_eq!(row_texts(&view).len(), 5, "its ancestors unfold");
+        assert_eq!(view.eff_sel(5), 4);
+        view.tick(&client);
+        let m = messages(&sent);
+        assert_eq!(m[0], "stopInspectingHost false");
+        assert!(m.iter().any(|m| m.contains("\"id\":6")), "{m:?}");
+    }
+
+    #[test]
+    fn a_tap_clears_a_filter_that_hides_it_and_filters_keep_the_selection() {
+        let (mut view, client, _sent) = components();
+        view.tick(&client);
+        view.on_event(RnEvent::Devtools(
+            APP.into(),
+            "operations".into(),
+            tree_ops(),
+        ));
+        view.filter = "header".into();
+        view.on_event(RnEvent::Devtools(
+            APP.into(),
+            "selectElement".into(),
+            json!(6),
+        ));
+        assert!(view.filter.is_empty());
+        assert_eq!(selected(&view), Some(6));
+        // Typing a filter that still shows the selection keeps it.
+        key(&mut view, &client, KeyCode::Char('f'));
+        for c in "item".chars() {
+            key(&mut view, &client, KeyCode::Char(c));
+        }
+        key(&mut view, &client, KeyCode::Enter);
+        assert_eq!(row_texts(&view), vec!["  Item", "  Item"]);
+        assert_eq!(selected(&view), Some(6));
+    }
+
+    #[test]
+    fn deep_trees_shift_left_to_follow_the_cursor() {
+        let (mut view, client, _sent) = components();
+        view.tick(&client);
+        // A chain 60 deep: Root 1 › C2 › C3 › … › C61.
+        let mut ops = vec![1, 1, 2, 1, 'C' as i64, 1, 1, 11, 0, 0, 1, 1];
+        for id in 2..=61 {
+            ops.extend([1, id, 5, id - 1, 0, 1, 0]);
+        }
+        view.on_event(RnEvent::Devtools(
+            APP.into(),
+            "operations".into(),
+            json!(ops),
+        ));
+        assert!(row_texts(&view)[0].starts_with("▾ C"));
+        key(&mut view, &client, KeyCode::Char('G'));
+        assert_eq!(selected(&view), Some(61));
+        let rows = row_texts(&view);
+        let indent = |r: &String| r.len() - r.trim_start().len();
+        // A third of the pane, plus the (blank) fold marker and its space.
+        assert_eq!(indent(rows.last().unwrap()), view.detail_width / 3 + 2);
+        assert_eq!(indent(&rows[0]), 0, "rows above the shift sit at the edge");
+    }
+
+    #[test]
+    fn s_works_in_the_detail_pane_and_repairs_the_overlay_first() {
+        let (mut view, client, sent) = components();
+        view.tick(&client);
+        view.on_event(RnEvent::Devtools(
+            APP.into(),
+            "operations".into(),
+            tree_ops(),
+        ));
+        key(&mut view, &client, KeyCode::Tab);
+        assert!(view.detail);
+        messages(&sent);
+        key(&mut view, &client, KeyCode::Char('s'));
+        view.tick(&client);
+        let m = messages(&sent);
+        let check = m.iter().position(|m| m.contains("__signalboxPickCheck"));
+        let start = m.iter().position(|m| m == "startInspectingHost null");
+        assert!(check.is_some() && check < start, "{m:?}");
+    }
+
+    #[test]
+    fn keeps_the_outline_until_leaving_the_tab() {
+        let (mut view, client, sent) = components();
+        view.tick(&client);
+        view.on_event(RnEvent::Devtools(
+            APP.into(),
+            "operations".into(),
+            tree_ops(),
+        ));
+        key(&mut view, &client, KeyCode::Char('j'));
+        view.tick(&client);
+        let m = messages(&sent);
+        assert!(
+            m.iter().any(|m| m.starts_with("highlightHostInstance")
+                && m.contains("\"hideAfterTimeout\":false")),
+            "{m:?}"
+        );
+        view.tick(&client);
+        assert!(!messages(&sent)
+            .iter()
+            .any(|m| m.starts_with("clearHostInstanceHighlight")));
+        key(&mut view, &client, KeyCode::Char(']'));
+        view.tick(&client);
+        assert_eq!(messages(&sent)[0], "clearHostInstanceHighlight null");
+    }
+
+    #[test]
+    fn tab_and_enter_move_between_the_panes() {
+        let (mut view, client, _sent) = components();
+        view.tick(&client);
+        assert!(!view.next_pane(false), "nothing to show yet");
+        view.on_event(RnEvent::Devtools(
+            APP.into(),
+            "operations".into(),
+            tree_ops(),
+        ));
+        // As the dashboard drives it: past the detail pane, Tab leaves.
+        assert!(view.next_pane(false) && view.detail);
+        assert!(!view.next_pane(false));
+        assert!(view.next_pane(true) && !view.detail);
+        assert!(!view.next_pane(true));
+        view.enter_pane(true);
+        assert!(view.detail);
+        // Standalone: Tab toggles; Enter goes in, Esc comes back.
+        key(&mut view, &client, KeyCode::Tab);
+        assert!(!view.detail);
+        key(&mut view, &client, KeyCode::Enter);
+        assert!(view.detail);
+        key(&mut view, &client, KeyCode::Esc);
+        assert!(!view.detail);
+        // In the list, j moves the tree; in the detail pane, its cursor.
+        key(&mut view, &client, KeyCode::Char('j'));
+        assert_eq!(selected(&view), Some(3));
+        key(&mut view, &client, KeyCode::Tab);
+        key(&mut view, &client, KeyCode::Char('j'));
+        assert_eq!((selected(&view), view.detail_cursor), (Some(3), 1));
+    }
+
+    #[test]
+    fn enter_edits_a_prop_and_marks_it() {
+        let (mut view, client, sent) = components();
+        view.tick(&client);
+        view.on_event(RnEvent::Devtools(
+            APP.into(),
+            "operations".into(),
+            tree_ops(),
+        ));
+        view.tick(&client);
+        let hello = json!({"id": 2, "type": "full-data", "value": {
+            "props": {"data": {"children": "Hello"}, "cleaned": [], "unserializable": []}}});
+        view.on_event(RnEvent::Devtools(
+            APP.into(),
+            "inspectedElement".into(),
+            hello.clone(),
+        ));
+        messages(&sent);
+        // Enter in the list goes to the detail pane; there, on a prop line, edits.
+        key(&mut view, &client, KeyCode::Enter);
+        key(&mut view, &client, KeyCode::Enter);
+        assert!(!view.is_capturing_input(), "the header isn't a prop");
+        key(&mut view, &client, KeyCode::Char('j'));
+        key(&mut view, &client, KeyCode::Char('j'));
+        // The prompt starts with the prop's value; typing replaces the end of it.
+        key(&mut view, &client, KeyCode::Enter);
+        assert!(view.is_capturing_input());
+        assert_eq!(view.input, r#"children = "Hello""#);
+        for _ in 0..6 {
+            key(&mut view, &client, KeyCode::Backspace);
+        }
+        for c in r#"Bye""#.chars() {
+            key(&mut view, &client, KeyCode::Char(c));
+        }
+        key(&mut view, &client, KeyCode::Enter);
+        assert!(!view.is_capturing_input());
+        view.tick(&client);
+        let sent_now = messages(&sent);
+        assert!(sent_now.contains(
+            &r#"overrideValueAtPath {"hookID":null,"id":2,"path":["children"],"rendererID":1,"type":"props","value":"Bye"}"#
+                .to_string()
+        ), "{sent_now:?}");
+        view.on_event(RnEvent::Devtools(
+            APP.into(),
+            "inspectedElement".into(),
+            json!({"id": 2, "type": "full-data", "value": {
+                "props": {"data": {"children": "Bye"}, "cleaned": [], "unserializable": []}}}),
+        ));
+        assert!(view
+            .detail_source()
+            .contains(&r#"✎ children: "Bye"  (was "Hello")"#.to_string()));
+        // Esc leaves without editing; a malformed edit says how.
+        key(&mut view, &client, KeyCode::Enter);
+        key(&mut view, &client, KeyCode::Esc);
+        assert!(!view.is_capturing_input());
+        key(&mut view, &client, KeyCode::Enter);
+        view.input = "children".into();
+        key(&mut view, &client, KeyCode::Enter);
+        assert!(view
+            .flash
+            .as_deref()
+            .unwrap()
+            .starts_with("type path = value"));
+        view.tick(&client);
+        assert!(!messages(&sent)
+            .iter()
+            .any(|m| m.starts_with("overrideValueAtPath")));
+        // Putting the old value back stops keeping the edit.
+        key(&mut view, &client, KeyCode::Enter);
+        view.input = r#"children = "Hello""#.into();
+        key(&mut view, &client, KeyCode::Enter);
+        view.tick(&client);
+        let m = messages(&sent);
+        assert_eq!(
+            m[1],
+            r#"eval (h => h && h.unpin(2, ["children"]))(__REACT_DEVTOOLS_GLOBAL_HOOK__.__signalboxPins)"#,
+            "{m:?}"
+        );
+        view.on_event(RnEvent::Devtools(
+            APP.into(),
+            "inspectedElement".into(),
+            hello,
+        ));
+        assert!(view
+            .detail_source()
+            .contains(&r#"  children: "Hello""#.to_string()));
+    }
+
+    #[test]
+    fn o_needs_a_source() {
+        let (mut view, client, _sent) = components();
+        view.tick(&client);
+        view.on_event(RnEvent::Devtools(
+            APP.into(),
+            "operations".into(),
+            tree_ops(),
+        ));
+        key(&mut view, &client, KeyCode::Char('o'));
+        assert_eq!(
+            view.flash.as_deref(),
+            Some("can't tell where this component is used")
+        );
+        key(&mut view, &client, KeyCode::Char('O'));
+        assert_eq!(
+            view.flash.as_deref(),
+            Some("no source file for this component")
+        );
+        view.tick(&client);
+        view.on_event(RnEvent::Devtools(
+            APP.into(),
+            "inspectedElement".into(),
+            json!({"id": 2, "type": "full-data", "value": {"signalboxSource": "/app/src/App.tsx:7"}}),
+        ));
+        assert_eq!(
+            view.active_tree().unwrap().source(),
+            Some("/app/src/App.tsx:7")
+        );
+        // Shown relative to the project.
+        view.set_root(Some("/app".into()));
+        assert_eq!(
+            view.detail_source().last().map(String::as_str),
+            Some("  defined in App (src/App.tsx:7)")
+        );
+    }
+
+    #[test]
+    fn says_why_there_is_no_tree() {
+        let (mut view, client, _sent) = components();
+        let body = |view: &mut RnView| {
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 6)).unwrap();
+            term.draw(|f| view.render(f, f.area())).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..6)
+                .map(|y| (0..90).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(body(&mut view).contains("Connecting to the app's React DevTools"));
+        view.tick(&client);
+        assert!(body(&mut view).contains("Waiting for the component tree"));
+        view.on_event(RnEvent::Devtools(
+            APP.into(),
+            "signalbox:unavailable".into(),
+            json!("this app has no React DevTools backend"),
+        ));
+        assert!(body(&mut view).contains("this app has no React DevTools backend."));
+    }
+
+    #[test]
+    fn c_does_not_clear_logs_from_the_tree() {
+        let (mut view, client, _sent) = components();
+        view.on_event(RnEvent::Log(
+            APP.into(),
+            LogEntry {
+                level: "log".into(),
+                text: "kept".into(),
+                expanded: None,
+                stack: None,
+            },
+        ));
+        key(&mut view, &client, KeyCode::Char('c'));
+        assert_eq!(view.devices[APP].logs.len(), 1);
+    }
 }

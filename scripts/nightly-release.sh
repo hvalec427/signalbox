@@ -3,27 +3,21 @@
 # tagged with the UTC date (e.g. 0.2.0-nightly.20261008) — one build per day.
 set -euo pipefail
 
-REPO="hvalec427/metroctl"
+REPO="hvalec427/signalbox"
 
-# Base = next minor above the latest stable, so nightlies sort ahead of stable.
+# Base = the version the next stable release will get; LATEST is for notes.
 # Authenticated: Actions runners share IPs and hit the anonymous rate limit (403).
 LATEST=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
   "https://api.github.com/repos/$REPO/releases/latest" \
   | grep '"tag_name"' | head -1 | cut -d'"' -f4 | sed 's/^v//')
-if [ -n "${LATEST:-}" ]; then
-  MAJOR=$(echo "$LATEST" | cut -d. -f1)
-  MINOR=$(echo "$LATEST" | cut -d. -f2)
-  BASE="${MAJOR}.$((MINOR + 1)).0"
-else
-  BASE="0.1.0"
-fi
+BASE=$(bash scripts/next-version.sh)
 
 # Previous nightly = highest date suffix.
 TS=$(date -u +%Y%m%d)
 TAG="v${BASE}-nightly.${TS}"
 # Sort on the 8-digit date prefix first: older nightlies used 14-digit
 # timestamps, which would otherwise always sort above plain dates.
-PREV=$(git tag -l 'v*-nightly.*' | grep -vx -e "${TAG}" | sort -t. -k4.1,4.8n -k4,4n | tail -1)
+PREV=$(git tag -l 'v*-nightly.*' | { grep -vx -e "${TAG}" || true; } | sort -t. -k4.1,4.8n -k4,4n | tail -1)
 [ -z "${PREV}" ] && PREV="${LATEST:+v$LATEST}"
 
 # Skip when nothing that affects the binary changed since the last nightly.
@@ -53,11 +47,11 @@ NOTES=$(mktemp)
   echo "### Install this build"
   echo
   echo '```sh'
-  echo "curl -fsSL https://github.com/${REPO}/releases/download/${TAG}/metroctl-darwin-arm64 -o metroctl \\"
-  echo "  && chmod +x metroctl && sudo mv metroctl /usr/local/bin/metroctl"
+  echo "curl -fsSL https://github.com/${REPO}/releases/download/${TAG}/signalbox-darwin-arm64 -o signalbox \\"
+  echo "  && chmod +x signalbox && sudo mv signalbox /usr/local/bin/signalbox"
   echo '```'
   echo
-  echo "_Apple Silicon shown; on Intel use \`metroctl-darwin-x64\`. Already installed? \`metroctl update --nightly\`._"
+  echo "_Apple Silicon shown; on Intel use \`signalbox-darwin-x64\`. Already installed? \`signalbox update --nightly\`._"
 } > "${NOTES}"
 
 # A nightly already cut today is replaced, so the day's last build wins.
@@ -71,4 +65,4 @@ gh release create "${TAG}" \
   --target "$(git rev-parse HEAD)" \
   --title "${TAG}" \
   --notes-file "${NOTES}" \
-  metroctl-darwin-arm64 metroctl-darwin-x64
+  signalbox-darwin-arm64 signalbox-darwin-x64

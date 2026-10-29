@@ -1,4 +1,4 @@
-//! React Native project config (`~/.config/metroctl/config.json`): a registry of
+//! React Native project config (`~/.config/signalbox/config.json`): a registry of
 //! projects keyed by repo root, each describing how to run Metro and how to
 //! build/run iOS and Android (serde with camelCase names).
 
@@ -79,12 +79,73 @@ pub struct MetroConfig {
 }
 
 /// A deep link entry: either a bare URL string, or `{ "name": …, "url": … }`
-/// for a friendlier label in the picker.
+/// for a friendlier label in the picker, optionally with a `"group"`: the
+/// picker puts a heading above each run of links that share one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum DeepLink {
     Url(String),
-    Named { name: String, url: String },
+    Named {
+        name: String,
+        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<String>,
+    },
+}
+
+/// `<name>` / `{name}` placeholders in a link, in order, without duplicates.
+pub fn link_placeholders(url: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let b = url.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let close = match b[i] {
+            b'<' => b'>',
+            b'{' => b'}',
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let rest = &url[i + 1..];
+        match rest.find(close as char) {
+            Some(end)
+                if end > 0
+                    && rest[..end]
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') =>
+            {
+                let name = rest[..end].to_string();
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+                i += end + 2;
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+/// Fill a link's placeholders, percent-encoding the values (they go into a URL).
+pub fn fill_link(url: &str, values: &[(String, String)]) -> String {
+    let mut s = url.to_string();
+    for (k, v) in values {
+        let enc: String = v
+            .bytes()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || b"-._~".contains(&c) {
+                    (c as char).to_string()
+                } else {
+                    format!("%{c:02X}")
+                }
+            })
+            .collect();
+        s = s
+            .replace(&format!("<{k}>"), &enc)
+            .replace(&format!("{{{k}}}"), &enc);
+    }
+    s
 }
 
 impl DeepLink {
@@ -100,6 +161,12 @@ impl DeepLink {
             DeepLink::Named { name, .. } => name,
         }
     }
+    pub fn group(&self) -> Option<&str> {
+        match self {
+            DeepLink::Url(_) => None,
+            DeepLink::Named { group, .. } => group.as_deref(),
+        }
+    }
 }
 
 /// A platform's build/run command. Which device it runs on is chosen live from
@@ -110,7 +177,7 @@ impl DeepLink {
 /// `command` may contain a `{udid}` (iOS) / `{serial}` (Android) placeholder,
 /// substituted with the selected device so it lands in the right spot — e.g.
 /// `"react-native run-ios --udid {udid} --scheme Foo -- --reset-cache"`. Without
-/// a placeholder metroctl appends `--udid`/`--deviceId`, which a `-- …`
+/// a placeholder signalbox appends `--udid`/`--deviceId`, which a `-- …`
 /// passthrough in the script would send to the wrong side.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PlatformConfig {
@@ -125,7 +192,11 @@ pub struct ProjectConfig {
     pub name: String,
     /// Absolute repo root; matched as a path prefix of the current directory.
     pub root: String,
-    #[serde(rename = "packageManager", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "packageManager",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub package_manager: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metro: Option<MetroConfig>,
@@ -137,10 +208,18 @@ pub struct ProjectConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deeplinks: Vec<DeepLink>,
     /// Override for the deep-clean command (`c` in the Processes pane).
-    #[serde(rename = "cleanCommand", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "cleanCommand",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub clean_command: Option<String>,
     /// Override for the reinstall command (`i` in the Processes pane).
-    #[serde(rename = "installCommand", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "installCommand",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub install_command: Option<String>,
 }
 
@@ -184,7 +263,15 @@ impl ProjectConfig {
     }
 
     pub fn metro_port(&self) -> u16 {
-        self.metro.as_ref().and_then(|m| m.port).unwrap_or(DEFAULT_PORT)
+        self.metro
+            .as_ref()
+            .and_then(|m| m.port)
+            .unwrap_or(DEFAULT_PORT)
+    }
+
+    /// Override the Metro port for this run (not saved).
+    pub fn set_metro_port(&mut self, port: u16) {
+        self.metro.get_or_insert_with(Default::default).port = Some(port);
     }
 
     pub fn ios_command(&self) -> String {
@@ -219,10 +306,15 @@ impl ProjectConfig {
         self.install_command
             .clone()
             .filter(|c| !c.trim().is_empty())
-            .unwrap_or_else(|| format!("{} && npx pod-install", self.package_manager().install_command()))
+            .unwrap_or_else(|| {
+                format!(
+                    "{} && npx pod-install",
+                    self.package_manager().install_command()
+                )
+            })
     }
 
-    /// Env for every command metroctl spawns: the Metro port exported as
+    /// Env for every command signalbox spawns: the Metro port exported as
     /// `RCT_METRO_PORT`, so the port is configured in exactly one place (`metro.port`).
     pub fn command_env(&self) -> BTreeMap<String, String> {
         let mut env = BTreeMap::new();
@@ -238,8 +330,25 @@ pub struct RnConfig {
 }
 
 pub fn rn_config_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".config/metroctl/config.json")
+    // $SIGNALBOX_HOME: another config folder (e.g. a test instance's).
+    if let Some(dir) = std::env::var_os("SIGNALBOX_HOME").filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir).join("config.json");
+    }
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    let dir = home.join(".config/signalbox");
+    // Projects registered before the rename (metroctl) move over once.
+    let old = home.join(".config/metroctl");
+    if !dir.exists() && old.exists() {
+        let _ = std::fs::rename(&old, &dir);
+    }
+    dir.join("config.json")
+}
+
+/// `$SIGNALBOX_<name>`, or `$METROCTL_<name>` from before the rename.
+pub fn env(name: &str) -> Option<String> {
+    [format!("SIGNALBOX_{name}"), format!("METROCTL_{name}")]
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
 }
 
 pub fn load_rn_config() -> Result<Option<RnConfig>> {
@@ -273,15 +382,92 @@ pub fn project_for_dir<'a>(cfg: &'a RnConfig, dir: &Path) -> Option<&'a ProjectC
 
 /// The registered project matching the current working directory. `rn init`
 /// stores canonicalized roots, so a canonicalized cwd matches through symlinks.
-pub fn current_project(cfg: &RnConfig) -> Option<&ProjectConfig> {
+/// In a git worktree of a registered project, that project's config is used
+/// with its root moved into the worktree.
+pub fn current_project(cfg: &RnConfig) -> Option<ProjectConfig> {
     let cwd = std::env::current_dir().ok()?;
     let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
-    project_for_dir(cfg, &cwd)
+    if let Some(p) = project_for_dir(cfg, &cwd) {
+        return Some(p.clone());
+    }
+    let (main, worktree) = git_worktree_roots(&cwd)?;
+    project_in_worktree(cfg, &main, &worktree, &cwd)
+}
+
+/// (main checkout, this worktree) top-level dirs, when `dir` is inside a
+/// linked git worktree.
+pub fn git_worktree_roots(dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+            "--show-toplevel",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines = text.lines();
+    let common = PathBuf::from(lines.next()?.trim());
+    let worktree = PathBuf::from(lines.next()?.trim());
+    // The main checkout's git dir is `<main>/.git`; a bare repo has no checkout.
+    let main = common
+        .parent()
+        .filter(|_| common.file_name().is_some_and(|n| n == ".git"))?
+        .to_path_buf();
+    let main = std::fs::canonicalize(&main).unwrap_or(main);
+    let worktree = std::fs::canonicalize(&worktree).unwrap_or(worktree);
+    (main != worktree).then_some((main, worktree))
+}
+
+/// The registered project in `main` that `dir` corresponds to inside
+/// `worktree`, with its root rebased onto the worktree.
+fn project_in_worktree(
+    cfg: &RnConfig,
+    main: &Path,
+    worktree: &Path,
+    dir: &Path,
+) -> Option<ProjectConfig> {
+    let (p, root) = cfg
+        .projects
+        .iter()
+        .filter_map(|p| {
+            let rel = Path::new(&p.root).strip_prefix(main).ok()?;
+            let root = if rel.as_os_str().is_empty() {
+                worktree.to_path_buf()
+            } else {
+                worktree.join(rel)
+            };
+            dir.starts_with(&root).then_some((p, root))
+        })
+        .max_by_key(|(p, _)| p.root.len())?;
+    let mut p = p.clone();
+    p.root = root.to_string_lossy().to_string();
+    if let Some(wt) = worktree.file_name().and_then(|n| n.to_str()) {
+        p.name = format!("{} · {wt}", p.name);
+    }
+    Some(p)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deep_link_group() {
+        let links: Vec<DeepLink> =
+            serde_json::from_str(r#"["app://", {"name": "A", "url": "app://a"}, {"name": "B", "url": "app://b", "group": "Tabs"}]"#).unwrap();
+        assert_eq!(
+            links.iter().map(|d| d.group()).collect::<Vec<_>>(),
+            vec![None, None, Some("Tabs")]
+        );
+        assert_eq!(links[2].label(), "B");
+    }
 
     #[test]
     fn package_manager_commands() {
@@ -306,8 +492,14 @@ mod tests {
     fn explicit_overrides_win() {
         let mut p = ProjectConfig::new("App".into(), "/tmp/app".into());
         p.package_manager = Some("yarn".into());
-        p.metro = Some(MetroConfig { command: Some("yarn web-start".into()), port: Some(9000) });
-        p.ios = Some(PlatformConfig { command: None, bundle_id: None });
+        p.metro = Some(MetroConfig {
+            command: Some("yarn web-start".into()),
+            port: Some(9000),
+        });
+        p.ios = Some(PlatformConfig {
+            command: None,
+            bundle_id: None,
+        });
         assert_eq!(p.metro_command(), "yarn web-start");
         assert_eq!(p.metro_port(), 9000);
         // ios.command unset → derived from the declared package manager (yarn).
@@ -317,8 +509,14 @@ mod tests {
     #[test]
     fn command_env_sets_metro_port() {
         let mut p = ProjectConfig::new("App".into(), "/tmp/app".into());
-        p.metro = Some(MetroConfig { command: None, port: Some(9000) });
-        assert_eq!(p.command_env().get("RCT_METRO_PORT").map(String::as_str), Some("9000"));
+        p.metro = Some(MetroConfig {
+            command: None,
+            port: Some(9000),
+        });
+        assert_eq!(
+            p.command_env().get("RCT_METRO_PORT").map(String::as_str),
+            Some("9000")
+        );
     }
 
     #[test]
@@ -335,6 +533,59 @@ mod tests {
         assert_eq!(hit.name, "outer");
         // Component-wise prefix: /dev must not match /development.
         assert!(project_for_dir(&cfg, Path::new("/Users/me/development")).is_none());
+    }
+
+    #[test]
+    fn link_placeholders_fill() {
+        let u = "laundryheap://?redirect=RC&uuid=<uuid>&t={token}&again=<uuid>";
+        assert_eq!(link_placeholders(u), vec!["uuid", "token"]);
+        assert_eq!(
+            fill_link(
+                u,
+                &[
+                    ("uuid".into(), "ab-12".into()),
+                    ("token".into(), "x+y=".into())
+                ]
+            ),
+            "laundryheap://?redirect=RC&uuid=ab-12&t=x%2By%3D&again=ab-12"
+        );
+        assert!(link_placeholders("laundryheap://booking?country=auto").is_empty());
+    }
+
+    #[test]
+    fn rebases_project_onto_worktree() {
+        let mut cfg = RnConfig::default();
+        cfg.projects.push(ProjectConfig::new(
+            "app".into(),
+            "/dev/repo/apps/mobile".into(),
+        ));
+        let (main, wt) = (
+            Path::new("/dev/repo"),
+            Path::new("/dev/repo-worktrees/feat"),
+        );
+        let p = project_in_worktree(
+            &cfg,
+            main,
+            wt,
+            Path::new("/dev/repo-worktrees/feat/apps/mobile/src"),
+        )
+        .unwrap();
+        assert_eq!(p.root, "/dev/repo-worktrees/feat/apps/mobile");
+        assert_eq!(p.name, "app · feat");
+        assert!(project_in_worktree(
+            &cfg,
+            main,
+            wt,
+            Path::new("/dev/repo-worktrees/feat/apps/web")
+        )
+        .is_none());
+        let mut cfg = RnConfig::default();
+        cfg.projects
+            .push(ProjectConfig::new("app".into(), "/dev/repo".into()));
+        assert_eq!(
+            project_in_worktree(&cfg, main, wt, wt).unwrap().root,
+            "/dev/repo-worktrees/feat"
+        );
     }
 
     #[test]

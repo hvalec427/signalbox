@@ -1,16 +1,22 @@
-//! `metroctl` — manage and run a React Native project from a single window.
+//! `signalbox` — manage and run a React Native project from a single window.
 //! No subcommand launches the dashboard TUI; `init` registers the current
 //! directory; `config` prints the config path.
 
-use crate::rnconfig::{current_project, load_rn_config, rn_config_path, save_rn_config, ProjectConfig, RnConfig};
+use crate::rnconfig::{
+    current_project, load_rn_config, rn_config_path, save_rn_config, ProjectConfig, RnConfig,
+};
+use crate::rndash::Setup;
+use crate::session::{self, Pinned, SimCleanup, UpOpts};
 use inquire::Text;
 
-/// `metroctl` — launch the dashboard for the current project.
-pub fn launch() {
+/// `signalbox` — launch the dashboard for the current project.
+pub fn launch(opts: UpOpts) {
     let cfg = match load_rn_config() {
         Ok(Some(c)) => c,
         Ok(None) => {
-            eprintln!("No projects configured yet. Run `metroctl init` in your project directory.");
+            eprintln!(
+                "No projects configured yet. Run `signalbox init` in your project directory."
+            );
             std::process::exit(1);
         }
         Err(e) => {
@@ -18,21 +24,149 @@ pub fn launch() {
             std::process::exit(1);
         }
     };
-    let project = match current_project(&cfg) {
-        Some(p) => p.clone(),
+    let mut project = match current_project(&cfg) {
+        Some(p) => p,
         None => {
             eprintln!("This directory isn't a registered React Native project.");
-            eprintln!("Run `metroctl init` here to add it.");
+            eprintln!("Run `signalbox init` here to add it.");
             std::process::exit(1);
         }
     };
-    if let Err(e) = crate::rndash::run(project) {
+    let setup = match prepare(&mut project, &opts) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{e:#}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = crate::rndash::run(project, setup) {
         eprintln!("{e}");
         std::process::exit(1);
     }
 }
 
-/// `metroctl init` — register (or update) the current directory as a project.
+/// Apply `up` options before the dashboard opens: the port override and the
+/// device to pin (creating a simulator or starting an emulator if asked).
+fn prepare(project: &mut ProjectConfig, opts: &UpOpts) -> anyhow::Result<Setup> {
+    for d in session::reap_stale() {
+        eprintln!("{d}");
+    }
+    // The port (and below, the device) are claimed for this session right
+    // away, so `up`s started together never share them.
+    let root = std::path::PathBuf::from(&project.root);
+    let mut claim = match opts.port {
+        Some(Some(p)) => session::Claim::port(&root, p, false)?,
+        Some(None) => session::Claim::port(&root, project.metro_port(), true)?,
+        None => session::Claim::port(&root, project.metro_port(), false)?,
+    };
+    project.set_metro_port(claim.port_number());
+    let cleanup = opts.sim_cleanup.unwrap_or(SimCleanup::Ask);
+    let pinned = if let Some(name) = &opts.new_sim {
+        let name = name
+            .clone()
+            .unwrap_or_else(|| session::default_sim_name(std::path::Path::new(&project.root)));
+        eprintln!("creating simulator {name}…");
+        let (udid, desc) = session::create_simulator(
+            &name,
+            opts.sim_runtime.as_deref(),
+            opts.sim_type.as_deref(),
+        )?;
+        eprintln!("created {desc} ({udid})");
+        claim.device(&udid, true)?;
+        Some(Pinned {
+            udid,
+            created: true,
+            simulator: true,
+            android: false,
+            cleanup,
+            name: Some(name),
+        })
+    } else if let Some(avd) = &opts.new_emulator {
+        let (serial, avd) = session::start_emulator(avd.as_deref())?;
+        eprintln!("started {avd} ({serial})");
+        claim.device(&serial, true)?;
+        Some(Pinned {
+            udid: serial,
+            created: true,
+            simulator: false,
+            android: true,
+            cleanup,
+            name: Some(avd),
+        })
+    } else {
+        let pinned = opts
+            .device
+            .as_deref()
+            .map(|id| session::pin_device(id, cleanup))
+            .transpose()?;
+        if let Some(p) = &pinned {
+            claim.device(&p.udid, false)?;
+        }
+        pinned
+    };
+    let up = opts.port.is_some() || pinned.is_some() || opts.install;
+    // --prebuilt: the main checkout's last simulator build, when there is one.
+    let prebuilt = match (&pinned, opts.prebuilt, project.ios_bundle_id()) {
+        (Some(p), true, Some(bundle)) if p.simulator => {
+            let main = crate::rnconfig::git_worktree_roots(std::path::Path::new(&project.root))
+                .map(|(m, _)| m);
+            let app = session::find_prebuilt_app(
+                bundle,
+                main.as_deref()
+                    .or(Some(std::path::Path::new(&project.root))),
+            );
+            match &app {
+                Some(a) => eprintln!("using prebuilt {}", a.display()),
+                None => eprintln!("no prebuilt app for {bundle} in DerivedData; building instead"),
+            }
+            app
+        }
+        _ => None,
+    };
+    Ok(Setup {
+        pinned,
+        install: opts.install,
+        start: up,
+        prebuilt,
+    })
+}
+
+/// `signalbox up --detach` — `up` in a tmux window (see `detach.rs`).
+pub fn detach(args: Vec<String>) {
+    let Some(project) = load_rn_config()
+        .ok()
+        .flatten()
+        .and_then(|c| current_project(&c))
+    else {
+        eprintln!("This directory isn't a registered React Native project (or a worktree of one).");
+        eprintln!("Run `signalbox init` in the main checkout first.");
+        std::process::exit(1);
+    };
+    let root = std::path::PathBuf::from(project.root);
+    if let Err(e) = crate::detach::run(&crate::detach::up_args(&args), &root) {
+        eprintln!("{e:#}");
+        std::process::exit(1);
+    }
+}
+
+/// `signalbox down` — stop the session running in this checkout.
+pub fn down(keep_sim: bool, detached_only: bool) {
+    let root = load_rn_config()
+        .ok()
+        .flatten()
+        .and_then(|c| current_project(&c))
+        .map(|p| std::path::PathBuf::from(p.root));
+    let root = root.or_else(|| std::env::current_dir().ok()).unwrap();
+    if detached_only && !session::read_session(&root).is_some_and(|s| s.detached) {
+        return;
+    }
+    if let Err(e) = session::down(&root, keep_sim) {
+        eprintln!("{e:#}");
+        std::process::exit(1);
+    }
+}
+
+/// `signalbox init` — register (or update) the current directory as a project.
 pub fn init() {
     let cwd = match std::env::current_dir() {
         Ok(d) => std::fs::canonicalize(&d).unwrap_or(d),
@@ -45,8 +179,15 @@ pub fn init() {
         eprintln!("Warning: no package.json here — this doesn't look like a JS project.");
     }
 
-    let default_name = cwd.file_name().and_then(|n| n.to_str()).unwrap_or("app").to_string();
-    let name = match Text::new("Project name:").with_default(&default_name).prompt() {
+    let default_name = cwd
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("app")
+        .to_string();
+    let name = match Text::new("Project name:")
+        .with_default(&default_name)
+        .prompt()
+    {
         Ok(n) => n,
         Err(_) => return,
     };
@@ -77,13 +218,20 @@ pub fn init() {
     println!("  metro   → {}  (:{})", p.metro_command(), p.metro_port());
     println!("  ios     → {}", p.ios_command());
     println!("  android → {}", p.android_command());
-    println!("\nEdit {} to customize commands, port, simulator/avd, or env.", rn_config_path().display());
+    println!(
+        "\nEdit {} to customize commands, port, simulator/avd, or env.",
+        rn_config_path().display()
+    );
 }
 
-/// `metroctl config` — print the config file path.
+/// `signalbox config` — print the config file path.
 pub fn print_config_path() {
     println!("{}", rn_config_path().display());
-    if load_rn_config().unwrap_or(None).map(|c: RnConfig| c.projects.is_empty()).unwrap_or(true) {
-        eprintln!("(no projects configured yet — run `metroctl init`)");
+    if load_rn_config()
+        .unwrap_or(None)
+        .map(|c: RnConfig| c.projects.is_empty())
+        .unwrap_or(true)
+    {
+        eprintln!("(no projects configured yet — run `signalbox init`)");
     }
 }

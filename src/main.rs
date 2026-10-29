@@ -1,9 +1,18 @@
-//! metroctl — a single-window React Native project dashboard (Metro, device
+//! signalbox — a single-window React Native project dashboard (Metro, device
 //! build/run, JS logs/network/perf), built on top of `simon` for device
 //! management. No subcommand opens the dashboard; `logs` is the standalone
 //! React Native log viewer; `init`/`config` manage the project registry.
 
 mod commands_rn;
+mod components;
+mod control;
+mod detach;
+mod devinfo;
+mod devlog;
+#[cfg(test)]
+mod fake_metro;
+mod mcp;
+mod metro_events;
 mod proc;
 mod rn;
 mod rnclient;
@@ -11,13 +20,14 @@ mod rnconfig;
 mod rndash;
 mod rntui;
 mod rnview;
+mod session;
 mod update;
 
 use clap::{Parser, Subcommand};
 use std::io::IsTerminal;
 
 #[derive(Parser)]
-#[command(name = "metroctl", version, about = "React Native project dashboard")]
+#[command(name = "signalbox", version, about = "React Native project dashboard")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -29,6 +39,66 @@ enum Command {
     Init,
     /// Print the path to the config file
     Config,
+    /// Open the dashboard set up for this checkout: pick a port, create/boot a
+    /// simulator, start Metro and build onto it
+    Up {
+        /// Metro port, or `auto` for the first free one from the configured port
+        #[arg(long)]
+        port: Option<String>,
+        /// Pin to an existing device: iOS udid, AVD name, adb serial, or a name only one device has; started if needed
+        #[arg(long, conflicts_with_all = ["new_sim", "new_emulator"])]
+        device: Option<String>,
+        /// Create a new simulator for this session (default name: signalbox-<dir>)
+        #[arg(long = "new-sim", value_name = "NAME", num_args = 0..=1, default_missing_value = "")]
+        new_sim: Option<String>,
+        /// Device type for --new-sim, e.g. "iPhone 16 Pro" (default: newest plain iPhone)
+        #[arg(long = "sim-type", requires = "new_sim")]
+        sim_type: Option<String>,
+        /// iOS runtime for --new-sim, e.g. 18.2 (default: newest installed)
+        #[arg(long = "sim-runtime", requires = "new_sim")]
+        sim_runtime: Option<String>,
+        /// Start a throwaway Android emulator for this session: a read-only instance of the AVD
+        /// (default: the only one), on its own port; what it writes is dropped when it stops
+        #[arg(long = "new-emulator", value_name = "AVD", num_args = 0..=1, default_missing_value = "", conflicts_with = "new_sim")]
+        new_emulator: Option<String>,
+        /// What to do with the created simulator or emulator when you quit
+        #[arg(long = "sim-cleanup", value_enum, default_value = "ask")]
+        sim_cleanup: session::SimCleanup,
+        /// Install JS deps and pods before starting Metro
+        #[arg(long)]
+        install: bool,
+        /// Install the app the main checkout already built (from Xcode's DerivedData) instead of
+        /// building; JS still comes from this checkout's Metro. Falls back to building.
+        #[arg(long)]
+        prebuilt: bool,
+        /// Run in a tmux server of signalbox's own (`tmux -L signalbox attach` to watch) and
+        /// return once the session is up, printing its port and device (for agents, which have
+        /// no terminal). A simulator it creates is deleted when it stops, unless --sim-cleanup
+        /// says otherwise.
+        #[arg(long)]
+        detach: bool,
+    },
+    /// Simulator helpers for tools that manage their own simulators
+    Sim {
+        #[command(subcommand)]
+        action: SimAction,
+    },
+    /// Clean up after signalbox sessions that died (simulators, app port settings)
+    Gc {
+        /// Also delete `signalbox-*` simulators no running session owns
+        #[arg(long)]
+        sims: bool,
+    },
+    /// Stop the signalbox session running in this checkout and delete the simulator it created
+    Down {
+        /// Keep the simulator
+        #[arg(long = "keep-sim")]
+        keep_sim: bool,
+        /// Only stop a session started with `up --detach` (an agent's), and don't fail when
+        /// there's nothing to stop: for hooks that clean up after an agent
+        #[arg(long = "detached-only")]
+        detached_only: bool,
+    },
     /// Stream React Native JS console + network from Metro (CDP)
     Logs {
         name: Option<String>,
@@ -39,7 +109,22 @@ enum Command {
         #[arg(long = "print-ws")]
         print_ws: bool,
     },
-    /// Check whether a newer version of metroctl is available
+    /// Send one request to this checkout's running dashboard (status, logs,
+    /// errors, network, request, output, reload, rebuild, restart_metro)
+    Ctl {
+        cmd: String,
+        /// Arguments as a JSON object, e.g. '{"level":"error","limit":20}'
+        args: Option<String>,
+    },
+    /// MCP server (stdio) for coding agents, backed by this checkout's dashboard
+    Mcp,
+    /// Print the bundler events of a Metro started elsewhere (dashboard helper)
+    #[command(name = "metro-events", hide = true)]
+    MetroEvents {
+        #[arg(long, default_value_t = 8081)]
+        port: u16,
+    },
+    /// Check whether a newer version of signalbox is available
     #[command(name = "check-update")]
     CheckUpdate {
         #[arg(long)]
@@ -49,7 +134,7 @@ enum Command {
         #[arg(long)]
         dev: bool,
     },
-    /// Update metroctl to the latest version (stays on the installed build's channel)
+    /// Update signalbox to the latest version (stays on the installed build's channel)
     Update {
         #[arg(long)]
         stable: bool,
@@ -63,15 +148,125 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum SimAction {
+    /// Create a simulator, cloned from a settled template (fast, ready to launch apps),
+    /// and print its udid. It isn't tracked: whoever creates it deletes it
+    /// (`xcrun simctl delete <udid>`).
+    New {
+        /// Simulator name
+        #[arg(long)]
+        name: String,
+        /// Device type, e.g. "iPhone 16 Pro" (default: newest plain iPhone)
+        #[arg(long = "sim-type")]
+        sim_type: Option<String>,
+        /// iOS runtime, e.g. 18.2 (default: newest installed)
+        #[arg(long = "sim-runtime")]
+        sim_runtime: Option<String>,
+    },
+}
+
 fn main() {
     let cli = Cli::parse();
     match cli.command {
-        None => commands_rn::launch(),
+        None => commands_rn::launch(session::UpOpts::default()),
+        Some(Command::Up {
+            port,
+            device,
+            new_sim,
+            sim_type,
+            sim_runtime,
+            new_emulator,
+            sim_cleanup,
+            install,
+            prebuilt,
+            detach,
+        }) => {
+            if detach {
+                let args: Vec<String> =
+                    std::env::args().skip_while(|a| a != "up").skip(1).collect();
+                commands_rn::detach(args);
+                return;
+            }
+            let port = match port.as_deref() {
+                None => None,
+                Some("auto") => Some(None),
+                Some(p) => match p.parse() {
+                    Ok(n) => Some(Some(n)),
+                    Err(_) => {
+                        eprintln!("--port must be a number or `auto`");
+                        std::process::exit(2);
+                    }
+                },
+            };
+            let new_sim = new_sim.map(|n| Some(n).filter(|n| !n.is_empty()));
+            let new_emulator = new_emulator.map(|n| Some(n).filter(|n| !n.is_empty()));
+            commands_rn::launch(session::UpOpts {
+                port,
+                device,
+                new_sim,
+                sim_type,
+                sim_runtime,
+                new_emulator,
+                sim_cleanup: Some(sim_cleanup),
+                install,
+                prebuilt,
+            })
+        }
+        Some(Command::Down {
+            keep_sim,
+            detached_only,
+        }) => commands_rn::down(keep_sim, detached_only),
+        Some(Command::Sim {
+            action:
+                SimAction::New {
+                    name,
+                    sim_type,
+                    sim_runtime,
+                },
+        }) => match session::create_simulator(&name, sim_runtime.as_deref(), sim_type.as_deref()) {
+            // stdout: just the udid, for scripts; the description goes to stderr.
+            Ok((udid, desc)) => {
+                eprintln!("created {name}: {desc}");
+                println!("{udid}");
+            }
+            Err(e) => {
+                eprintln!("{e:#}");
+                std::process::exit(1);
+            }
+        },
+        Some(Command::Gc { sims }) => {
+            if let Err(e) = session::gc(sims) {
+                eprintln!("{e:#}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Mcp) => mcp::run(),
+        Some(Command::Ctl { cmd, args }) => {
+            if let Err(e) = control::ctl(&cmd, args.as_deref()) {
+                eprintln!("{e:#}");
+                std::process::exit(1);
+            }
+        }
         Some(Command::Init) => commands_rn::init(),
         Some(Command::Config) => commands_rn::print_config_path(),
-        Some(Command::Logs { name, port, print_ws }) => logs(name, port, print_ws),
-        Some(Command::CheckUpdate { stable, nightly, dev }) => update::check_update(stable, nightly, dev),
-        Some(Command::Update { stable, nightly, dev, force }) => update::update(stable, nightly, dev, force),
+        Some(Command::Logs {
+            name,
+            port,
+            print_ws,
+        }) => logs(name, port, print_ws),
+        Some(Command::MetroEvents { port }) => metro_events::watch(port),
+        Some(Command::CheckUpdate {
+            stable,
+            nightly,
+            dev,
+        }) => update::check_update(stable, nightly, dev),
+        Some(Command::Update {
+            stable,
+            nightly,
+            dev,
+            force,
+        }) => update::update(stable, nightly, dev, force),
     }
 }
 

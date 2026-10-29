@@ -1,0 +1,40 @@
+┌ Processes  no processes ───────────────────────────────────────────────────┐┌ Devices & Actions ───────────────────────────────┐
+│    ┌ Keys ────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐    │
+│Pres│ Global                                                     Logs · Network · Perf                                     │    │
+│    │   ⇥ / ⇧⇥      next / previous pane (logs: list, detail)      1-9         switch device                               │    │
+│    │   ^←→↑↓       resize panes                                   /  n N      search, next / previous match               │    │
+│    │   R           reload the app                                 f           filter                                      │    │
+│    │   D           open the dev menu                              ⏎           go to the detail pane                       │    │
+│    │   ?           this help                                      V           visual select, then y                       │    │
+│    │   q / ^C      quit                                           y           copy                                        │    │
+│    │                                                              c           clear                                       │    │
+│    │ Every pane                                                   p           clear on reload on/off                      │    │
+│    │   j k  ↑ ↓    move / scroll                                                                                          │    │
+│    │   g  G        top / bottom                                 Detail pane                                               │    │
+│    │   space       autoscroll on/off                              ⏎           open file:line in nvim, else copy the line  │    │
+│    │   [  ]        previous / next tab                            Esc         back to the list                            │    │
+│    │                                                              J K         scroll it from the list                     │    │
+│    │ Processes                                                    {  }        previous / next section                     │    │
+└────│   ⏎           type into the process (Esc leaves)             o           open file:line in nvim                      │────┘
+┌ JS │   x           stop it                                        F           show framework stack frames                 │────┐
+│ … ·│   d           delete a stopped tab                                                                                   │    │
+│    │   m           start / restart Metro (takes over an externa Network                                                   │    │
+│    │   c           deep clean (reinstalls)                        e           errors only                                 │    │
+│    │   i           reinstall deps + pods                          m           cycle method filter                         │    │
+│    │   a           reset: deep clean, then Metro                  c / C       copy as curl                                │    │
+│    │                                                                                                                      │    │
+│    │ Devices                                                    Components                                                │    │
+│    │   ⏎           start the simulator / emulator                 s           select by tapping it in the app             │    │
+│    │   s           stop it                                        h l  ← →    fold / unfold, or out / in                  │    │
+│    │   b           build & run on it                              u           parent                                      │    │
+│    │   o           open the app                                   o / O       open where it's used / defined              │    │
+│    │   l           open a deep link (fills ‹placeholders›; / se   ⏎           detail pane: edit the prop on the line      │    │
+│    │                                                                                                                      │    │
+│    │                                                            Debugger (paused)                                         │    │
+│    │                                                              F5          continue                                    │    │
+│    │                                                              F10         step over                                   │    │
+│    │                                                              F11 / ⇧F11  step into / out                             │    │
+│    │                                                              F6          pause                                       │    │
+│    └─────────────────────────────────────────────────────────────────────────────────────────────────────── ? / esc close ┘    │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ ⇥ focus · ^←→↑↓ resize · R reload · D dev-menu · ? keys · q quit
