@@ -57,6 +57,7 @@ pub struct DashApp {
     focus: Pane,
     input_mode: bool,
     devices: Vec<DeviceRow>,
+    devices_loaded: bool, // the poller has sent its first list
     dev_sel: usize,
     rx: Receiver<DashMsg>,
     tx: Sender<DashMsg>,
@@ -191,6 +192,7 @@ impl DashApp {
         DashApp {
             ctl_rx,
             socket,
+            devices_loaded: false,
             ..DashApp::bare(project, pinned, client, tx, rx)
         }
     }
@@ -217,6 +219,7 @@ impl DashApp {
             focus: Pane::Processes,
             input_mode: false,
             devices: Vec::new(),
+            devices_loaded: true, // no poller to wait for
             dev_sel: 0,
             rx,
             tx,
@@ -1155,6 +1158,7 @@ impl DashApp {
                 match m {
                     DashMsg::Devices(v) => {
                         self.devices = v;
+                        self.devices_loaded = true;
                         if self.dev_sel >= self.devices.len() {
                             self.dev_sel = self.devices.len().saturating_sub(1);
                         }
@@ -1618,6 +1622,17 @@ fn render_devices(app: &mut DashApp, frame: &mut Frame, area: Rect) {
     };
 
     let mut lines: Vec<Line> = vec![metro_line, Line::raw("")];
+    if !app.devices_loaded {
+        // The first simctl/adb/devicectl pass takes a few seconds.
+        const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let frame_i = (app.started.elapsed().as_millis() / 100) as usize % SPINNER.len();
+        lines.push(Line::styled(
+            format!("  {} looking for devices…", SPINNER[frame_i]),
+            Style::default().fg(Color::DarkGray),
+        ));
+        frame.render_widget(Paragraph::new(Text::from(lines)), content);
+        return;
+    }
     if app.devices.is_empty() {
         lines.push(Line::styled(
             "  (no simulators/emulators found)",
@@ -1876,6 +1891,15 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_layout() {
+        let mut app = app();
+        app.focus = Pane::Processes;
+        snapshot("dashboard", &mut app, 100, 30);
+        key(&mut app, KeyCode::Tab);
+        snapshot("dashboard_devices_focused", &mut app, 100, 30);
+    }
+
+    #[test]
     fn physical_ios_commands_use_device_instead_of_udid() {
         assert_eq!(
             udid_flag_to_device(
@@ -1891,12 +1915,20 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_layout() {
+    fn devices_pane_shows_loading_without_keys_until_the_first_list() {
         let mut app = app();
-        app.focus = Pane::Processes;
-        snapshot("dashboard", &mut app, 100, 30);
-        key(&mut app, KeyCode::Tab);
-        snapshot("dashboard_devices_focused", &mut app, 100, 30);
+        let devices = std::mem::take(&mut app.devices);
+        app.devices_loaded = false;
+        let s = screen(&mut app, 100, 30);
+        assert!(s.contains("looking for devices…"), "{s}");
+        assert!(
+            !s.contains("no simulators") && !s.contains("b build"),
+            "{s}"
+        );
+        app.devices = devices;
+        app.devices_loaded = true;
+        let s = screen(&mut app, 100, 30);
+        assert!(s.contains("iPhone 16") && s.contains("b build"), "{s}");
     }
 
     #[test]
