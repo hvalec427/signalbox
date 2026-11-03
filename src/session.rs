@@ -1045,9 +1045,16 @@ pub fn install_prebuilt_command(udid: &str, app: &Path, bundle: &str, port: u16)
 /// Shell command that boots a simulator, shows it (Device Hub on Xcode 27,
 /// Simulator.app before) and waits until it's ready.
 pub fn boot_command(udid: &str) -> String {
-    let app = format!("'{}'", simon::ios::simulator_app().replace('\'', "'\\''"));
+    let app = simon::ios::simulator_app();
+    // On Xcode 27 an older Xcode's Simulator.app would show the sim too.
+    let quit_old = if simon::ios::is_device_hub(&app) {
+        format!("osascript -e '{}'; ", simon::ios::QUIT_SIMULATOR_APP)
+    } else {
+        String::new()
+    };
+    let app = format!("'{}'", app.replace('\'', "'\\''"));
     format!(
-        "xcrun simctl boot {udid} 2>/dev/null; open -a {app} --args -CurrentDeviceUDID {udid}; echo 'waiting for the simulator to finish booting…'; xcrun simctl bootstatus {udid} -b"
+        "xcrun simctl boot {udid} 2>/dev/null; {quit_old}open -a {app} --args -CurrentDeviceUDID {udid}; echo 'waiting for the simulator to finish booting…'; xcrun simctl bootstatus {udid} -b"
     )
 }
 
