@@ -109,12 +109,14 @@ so Metro and your builds use the same port. It defaults to `8081`.
 `⏎` to build & run on it. If it's a sim/emulator that isn't up yet, `⏎` boots it
 first — press `⏎` again once it shows `● running` (its id isn't known until then,
 and building early targets the wrong device). signalbox targets your pick with
-`--udid` (iOS) and `--deviceId` + the `ANDROID_SERIAL` env (Android).
+`--udid` (iOS simulator), `--device` (physical iPhone — `run-ios --udid` fails on
+those) and `--deviceId` + the `ANDROID_SERIAL` env (Android).
 
 If your build script ends in a `-- …` passthrough, an appended `--udid`/`--deviceId`
 would land on the wrong side of the `--` and be ignored. Put a **`{udid}`** (iOS) /
 **`{serial}`** (Android) placeholder in `ios.command` / `android.command` instead, so
-it lands exactly where you want — signalbox substitutes the selected device:
+it lands exactly where you want — signalbox substitutes the selected device (and
+rewrites `--udid {udid}` to `--device {udid}` for a physical iPhone):
 
 ```json
 "ios": { "command": "npx react-native run-ios --udid {udid} --scheme 'MyApp' -- --reset-cache" }

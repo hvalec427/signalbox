@@ -527,6 +527,16 @@ impl DashApp {
                 .is_some_and(|p| p.simulator && p.udid == udid)
     }
 
+    fn is_physical_ios(&self, udid: &str) -> bool {
+        self.devices
+            .iter()
+            .any(|d| matches!(&d.open, Some(OpenTarget::IosPhysical(u)) if u == udid))
+            || self
+                .pinned
+                .as_ref()
+                .is_some_and(|p| !p.simulator && p.udid == udid)
+    }
+
     /// Once an iOS simulator build succeeds, make the app load from our Metro
     /// port. The port in the build (`RCT_METRO_PORT`) is ignored when React
     /// Native ships prebuilt, so set the app's `RCT_jsLocation` on that
@@ -779,11 +789,20 @@ impl DashApp {
         // for a plain `run-ios`, but a `--` in the script sends it to the wrong
         // side, so iOS also relies on the target already being booted; see below).
         let placeholder = if android { "{serial}" } else { "{udid}" };
+        // run-ios's `--udid` resolves a fallback simulator first and dies with
+        // "No simulator available with udid" for a physical device, so physical
+        // iPhones get `--device` instead.
+        let physical_ios = !android && id.as_deref().is_some_and(|u| self.is_physical_ios(u));
+        if physical_ios {
+            cmd = udid_flag_to_device(&cmd);
+        }
         if cmd.contains(placeholder) {
             cmd = cmd.replace(placeholder, id.as_deref().unwrap_or(""));
         } else if let Some(ref id) = id {
             let flag = if android {
                 format!("--deviceId {id}")
+            } else if physical_ios {
+                format!("--device {id}")
             } else {
                 format!("--udid {id}")
             };
@@ -1742,6 +1761,13 @@ fn render_status(app: &DashApp, frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(padded).style(style), area);
 }
 
+/// `--udid {udid}` → `--device {udid}` in an iOS command (the form run-ios
+/// needs for a physical device).
+fn udid_flag_to_device(cmd: &str) -> String {
+    cmd.replace("--udid {udid}", "--device {udid}")
+        .replace("--udid={udid}", "--device={udid}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::links::{picker_char, picker_index};
@@ -1847,6 +1873,21 @@ mod tests {
         let want = std::fs::read_to_string(&path)
             .unwrap_or_else(|_| panic!("missing {path}; run with UPDATE_SNAPSHOTS=1"));
         assert!(got == want, "{name} changed:\n{got}");
+    }
+
+    #[test]
+    fn physical_ios_commands_use_device_instead_of_udid() {
+        assert_eq!(
+            udid_flag_to_device(
+                "npx react-native run-ios --udid {udid} --scheme 'A b' -- --reset-cache"
+            ),
+            "npx react-native run-ios --device {udid} --scheme 'A b' -- --reset-cache"
+        );
+        assert_eq!(
+            udid_flag_to_device("run-ios --udid={udid}"),
+            "run-ios --device={udid}"
+        );
+        assert_eq!(udid_flag_to_device("yarn ios"), "yarn ios");
     }
 
     #[test]
