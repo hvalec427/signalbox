@@ -1253,9 +1253,76 @@ fn get_object_tree(
     object_id: &str,
     depth: i32,
 ) -> Option<Vec<String>> {
-    let mut budget = EXPAND_BUDGET;
-    let val = build_value(socket, seq, object_id, depth, &mut budget)?;
+    let val = match serialize_in_app(socket, seq, object_id) {
+        Some(v) => v,
+        None => {
+            let mut budget = EXPAND_BUDGET;
+            build_value(socket, seq, object_id, depth, &mut budget)?
+        }
+    };
     Some(format_js(&val, "").lines().map(String::from).collect())
+}
+
+/// Walks a console object inside the app and returns it as plain JSON, so one
+/// round trip covers the whole tree (and getters run, as they would in a
+/// console). Values are shaped like `build_value`'s: `undefined` and functions
+/// become strings, and anything past the caps prints as `{…}`.
+const SERIALIZE_JS: &str = r#"function () {
+  var MAX_DEPTH = 8, MAX_ITEMS = 200, MAX_STR = 10000, nodes = 3000, stack = [];
+  function walk(v, d) {
+    if (v === undefined) return "undefined";
+    if (v === null) return null;
+    var t = typeof v;
+    if (t === "number") return isFinite(v) ? v : String(v);
+    if (t === "boolean") return v;
+    if (t === "string") return v.length > MAX_STR ? v.slice(0, MAX_STR) + "…" : v;
+    if (t === "bigint") return v + "n";
+    if (t === "symbol") return String(v);
+    if (t === "function") return "ƒ " + (v.name || "anonymous") + "()";
+    if (v instanceof Date) return isNaN(v) ? "Invalid Date" : v.toISOString();
+    if (v instanceof RegExp) return String(v);
+    if (v instanceof Error) return String(v.stack || v);
+    if (d > MAX_DEPTH || nodes-- <= 0) return "{…}";
+    if (stack.indexOf(v) >= 0) return "[Circular]";
+    stack.push(v);
+    var out, n = 0;
+    try {
+      if (Array.isArray(v)) {
+        out = [];
+        for (var i = 0; i < v.length && i < MAX_ITEMS; i++) out.push(walk(v[i], d + 1));
+        if (v.length > MAX_ITEMS) out.push("… " + (v.length - MAX_ITEMS) + " more");
+      } else if (typeof Map !== "undefined" && v instanceof Map) {
+        out = {};
+        v.forEach(function (val, key) { if (n++ < MAX_ITEMS) out[String(key)] = walk(val, d + 1); });
+      } else if (typeof Set !== "undefined" && v instanceof Set) {
+        out = [];
+        v.forEach(function (val) { if (n++ < MAX_ITEMS) out.push(walk(val, d + 1)); });
+      } else {
+        out = {};
+        for (var k in v) {
+          if (n++ >= MAX_ITEMS) { out["…"] = "more keys"; break; }
+          try { out[k] = walk(v[k], d + 1); } catch (e) { out[k] = "[Thrown: " + e + "]"; }
+        }
+      }
+    } finally { stack.pop(); }
+    return out;
+  }
+  return walk(this, 0);
+}"#;
+
+fn serialize_in_app(
+    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+    seq: &mut i64,
+    object_id: &str,
+) -> Option<Value> {
+    *seq += 1;
+    let req_id = *seq;
+    let _ = socket.send(tungstenite::Message::Text(json!({"id": req_id, "method": "Runtime.callFunctionOn", "params": {"objectId": object_id, "functionDeclaration": SERIALIZE_JS, "returnByValue": true}}).to_string()));
+    let result = await_result(socket, req_id)?;
+    if result.get("exceptionDetails").is_some() {
+        return None;
+    }
+    result["result"].get("value").cloned()
 }
 
 fn build_value(
@@ -1621,6 +1688,28 @@ mod tests {
         let tree = entry.expanded.expect("expanded tree").join("\n");
         assert!(tree.contains("k4: "), "{tree}");
         assert!(tree.contains("\"{…}\""), "{tree}");
+    }
+
+    #[test]
+    fn serializes_a_console_object_in_one_round_trip() {
+        let metro = FakeMetro::with(|req| match req["method"].as_str() {
+            Some("Runtime.callFunctionOn") => vec![reply(
+                req,
+                json!({"result": {"type": "object", "value": {
+                    "addresses": [{"id": 1}, {"id": 2}],
+                    "user": {"name": "Ana"},
+                }}}),
+            )],
+            _ => vec![reply(req, json!({}))],
+        });
+        let c = connect(&metro);
+        metro.send(json!({"method": "Runtime.consoleAPICalled", "params": {
+            "type": "log", "args": [{"type": "object", "objectId": "o", "description": "Object"}]}}));
+        let entry = log_text(&c.rx, "Object");
+        assert!(metro.requests("Runtime.getProperties").is_empty());
+        let tree = entry.expanded.expect("expanded tree").join("\n");
+        assert!(tree.contains("name: \"Ana\""), "{tree}");
+        assert!(tree.contains("id: 2"), "{tree}");
     }
 
     #[test]
