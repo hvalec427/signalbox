@@ -1806,7 +1806,7 @@ fn detail_jump(view: &mut RnView, dir: i32) {
     if hits.is_empty() {
         return;
     }
-    let base = view.detail_hit.unwrap_or(view.detail_scroll);
+    let base = view.detail_hit.unwrap_or(view.detail_cursor);
     let next = if dir == 1 {
         hits.iter().find(|&&i| i > base).copied().unwrap_or(hits[0])
     } else {
@@ -1817,6 +1817,7 @@ fn detail_jump(view: &mut RnView, dir: i32) {
             .unwrap_or(*hits.last().unwrap())
     };
     view.detail_hit = Some(next);
+    view.detail_cursor = next;
     view.detail_scroll = next.saturating_sub(DETAIL_CONTEXT);
 }
 
@@ -1825,13 +1826,14 @@ fn detail_jump_first(view: &mut RnView) {
     if hits.is_empty() {
         return;
     }
-    let from = view.detail_hit.unwrap_or(view.detail_scroll);
+    let from = view.detail_hit.unwrap_or(view.detail_cursor);
     let next = hits
         .iter()
         .find(|&&i| i >= from)
         .copied()
         .unwrap_or(hits[0]);
     view.detail_hit = Some(next);
+    view.detail_cursor = next;
     view.detail_scroll = next.saturating_sub(DETAIL_CONTEXT);
 }
 
@@ -3034,5 +3036,33 @@ mod tests {
         ));
         key(&mut view, &client, KeyCode::Char('c'));
         assert_eq!(view.devices[APP].logs.len(), 1);
+    }
+
+    #[test]
+    fn n_moves_the_detail_cursor_to_the_match() {
+        let (client, _sent) = RnClient::recording(APP);
+        let mut view = RnView::new(None);
+        view.on_event(RnEvent::Targets(vec![TargetInfo {
+            key: APP.into(),
+            label: APP.into(),
+            meta: None,
+        }]));
+        let tree: Vec<String> = (0..20).map(|i| format!("  k{i}: {i},")).collect();
+        view.on_event(RnEvent::Log(
+            APP.into(),
+            LogEntry {
+                level: "log".into(),
+                text: "big".into(),
+                expanded: Some(tree),
+                stack: None,
+            },
+        ));
+        view.detail = true;
+        view.search = "k12:".into();
+        let hit = detail_matches(&view)[0];
+        key(&mut view, &client, KeyCode::Char('n'));
+        assert_eq!(view.detail_cursor, hit);
+        key(&mut view, &client, KeyCode::Char('j'));
+        assert_eq!(view.detail_cursor, hit + 1);
     }
 }
