@@ -16,6 +16,7 @@ signalbox down     # stop the `up` session in this checkout
 signalbox gc       # clean up after sessions that died (--sims: orphaned simulators)
 signalbox sim new --name X   # clone a ready simulator from the template, print its udid (yours to delete)
 signalbox mcp      # MCP server for coding agents (see below)
+signalbox feedback # report a bug or an idea about signalbox (see below)
 ```
 
 ## Install
@@ -271,6 +272,7 @@ server on top of it for coding agents:
 | `output` | last lines of a process tab (build errors) |
 | `reload`, `rebuild`, `restart_metro` | drive the session |
 | `deeplinks` | the configured deep links (open them with `boop open`) |
+| `feedback` | report a bug or idea about signalbox itself (see [Feedback](#feedback)) |
 
 To see and use the app's screen (screenshots, element tree, taps, typing,
 deep links), use [boop](https://github.com/hvalec427/boop). Point it at
@@ -282,6 +284,30 @@ the session's device with `boop --device-from .signalbox/session.json …`.
 Claude Code: a plugin that gives each session in a React Native checkout its
 own simulator and Metro port, through `up --detach`, and an installer for
 signalbox, simon and boop.
+
+## Feedback
+
+Found a bug in signalbox, or missing something? Tell its maintainer:
+
+```sh
+signalbox feedback                                   # asks for a title and details
+signalbox feedback -t "Rebuild hangs on Android" -m "After …, I expected …"
+```
+
+It prints the item's number and link. Agents can do the same through the MCP
+`feedback` tool (a `title` and a `description`), meant for problems with
+signalbox itself, not with the app being worked on.
+
+Each item goes to signalbox's [feedbackBox](https://feedbackbox.hvalec.com)
+app with a little metadata: signalbox's version and channel, macOS version and
+architecture, whether it came from the CLI or MCP, and, when a session is
+running in the checkout, its platform, device name and OS version, bundle id,
+React Native version and Metro state. Never file paths, logs or errors.
+
+Release builds have the feedbackBox ingest key baked in. For a build of your
+own, put it in `.env` (see `.env.example`; `scripts/build-binaries.sh` loads it)
+or the environment when building (`SIGNALBOX_FEEDBACK_KEY=fbi_… cargo build`),
+or set it at runtime. `SIGNALBOX_FEEDBACK_URL` points it at another feedbackBox.
 
 ## Contributing
 

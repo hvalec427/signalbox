@@ -99,6 +99,14 @@ fn tools() -> Value {
           "inputSchema": obj(json!({ "wait": { "type": "boolean", "description": "Wait for the build to finish (default true)" } })) },
         { "name": "deeplinks", "description": "The app's deep links from the project config. Fill <placeholders> (e.g. a uuid or token from the task) and open one with `boop open <url>`.", "inputSchema": obj(json!({})) },
         { "name": "restart_metro", "description": "Restart Metro (e.g. after changing metro.config.js or installing JS deps).", "inputSchema": obj(json!({})) },
+        { "name": "feedback", "description": "Report a bug or an idea about signalbox itself (this MCP server, its dashboard, `up`/`down`, builds it runs) to signalbox's maintainer. \
+            Not for bugs in the user's app. Use it when signalbox gets in your way: a tool that fails or misreports, a missing tool you needed. \
+            Say what you did, what happened and what you expected; don't include secrets, file paths or the app's code or logs. \
+            signalbox's version and the session's device are attached.",
+          "inputSchema": { "type": "object", "properties": {
+              "title": { "type": "string", "description": "One-line summary (at most 200 characters)" },
+              "description": { "type": "string", "description": "Details: steps, what happened, what you expected" } },
+            "required": ["title"] } },
     ])
 }
 
@@ -179,6 +187,16 @@ fn call_tool(name: &str, a: &Value) -> Result<Vec<Value>> {
             Ok(text("Metro restarted"))
         }
         "rebuild" => rebuild(a["wait"].as_bool().unwrap_or(true)),
+        "feedback" => {
+            let title = a["title"].as_str().unwrap_or("");
+            let description = a["description"].as_str().unwrap_or("");
+            let sent = crate::feedback::send(title, description, crate::feedback::Source::Mcp)?;
+            Ok(text(
+                format!("Feedback sent (#{}) {}", sent.number, sent.url)
+                    .trim_end()
+                    .to_string(),
+            ))
+        }
         _ => bail!("unknown tool {name}"),
     }
 }

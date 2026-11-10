@@ -11,6 +11,7 @@ mod devinfo;
 mod devlog;
 #[cfg(test)]
 mod fake_metro;
+mod feedback;
 mod mcp;
 mod metro_events;
 mod proc;
@@ -118,6 +119,15 @@ enum Command {
     },
     /// MCP server (stdio) for coding agents, backed by this checkout's dashboard
     Mcp,
+    /// Send feedback about signalbox (a bug, an idea) to its maintainer
+    Feedback {
+        /// One-line summary (asked for when missing, in a terminal)
+        #[arg(short = 't', long)]
+        title: Option<String>,
+        /// Details
+        #[arg(short = 'm', long)]
+        message: Option<String>,
+    },
     /// Print the bundler events of a Metro started elsewhere (dashboard helper)
     #[command(name = "metro-events", hide = true)]
     MetroEvents {
@@ -242,6 +252,7 @@ fn main() {
             }
         }
         Some(Command::Mcp) => mcp::run(),
+        Some(Command::Feedback { title, message }) => feedback::command(title, message),
         Some(Command::Ctl { cmd, args }) => {
             if let Err(e) = control::ctl(&cmd, args.as_deref()) {
                 eprintln!("{e:#}");

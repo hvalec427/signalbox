@@ -57,6 +57,9 @@ jobs:
     needs: check
     # macOS: binaries are built for both Apple targets and ad-hoc code-signed.
     runs-on: macos-latest
+    env:
+      # feedbackBox ingest key, baked into the binaries for `signalbox feedback`.
+      SIGNALBOX_FEEDBACK_KEY: ${{ secrets.SIGNALBOX_FEEDBACK_KEY }}
     steps:
       - uses: actions/checkout@v4
         with:

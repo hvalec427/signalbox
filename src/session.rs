@@ -402,6 +402,20 @@ fn simctl_json(args: &[&str]) -> Result<Value> {
     Ok(serde_json::from_slice(&out.stdout)?)
 }
 
+/// The runtime id a simulator runs (`com.apple.CoreSimulator.SimRuntime.iOS-18-2`),
+/// or `None` if `udid` isn't a simulator.
+pub fn sim_runtime(udid: &str) -> Option<String> {
+    let v = simctl_json(&["list", "devices"]).ok()?;
+    v["devices"]
+        .as_object()?
+        .iter()
+        .find(|(_, l)| {
+            l.as_array()
+                .is_some_and(|l| l.iter().any(|d| d["udid"] == udid))
+        })
+        .map(|(runtime, _)| runtime.clone())
+}
+
 /// Simulator state (`Booted`, `Shutdown`, …), or `None` if `udid` isn't a simulator.
 pub fn sim_state(udid: &str) -> Option<String> {
     sim_info(udid).map(|(state, _)| state)

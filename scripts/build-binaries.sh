@@ -8,6 +8,18 @@ VERSION="$1"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# Build-time settings (SIGNALBOX_FEEDBACK_KEY) from a local, gitignored .env; CI
+# sets them from repo secrets instead.
+if [ -f .env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . ./.env
+  set +a
+fi
+if [ -z "${SIGNALBOX_FEEDBACK_KEY:-}" ]; then
+  echo "Note: SIGNALBOX_FEEDBACK_KEY isn't set; \`signalbox feedback\` won't work in this build." >&2
+fi
+
 # Inline the version so the binary reports it (env!("CARGO_PKG_VERSION")).
 sed -i.bak "s/^version = .*/version = \"${VERSION}\"/" Cargo.toml
 rm -f Cargo.toml.bak
