@@ -16,7 +16,7 @@
 │    │                                                              J K         scroll it from the list                     │    │
 │    │ Processes                                                    {  }        previous / next section                     │    │
 └────│   ⏎           type into the process (Esc leaves)             o           open file:line in nvim                      │────┘
-┌ JS │   x           stop it                                        F           show framework stack frames                 │────┐
+┌ JS │   x           stop it                                        F           show library code in stacks                 │────┐
 │ … ·│   d           delete a stopped tab                                                                                   │    │
 │    │   m           start / restart Metro (takes over an externa Network                                                   │    │
 │    │   c           deep clean (reinstalls)                        e           errors only                                 │    │

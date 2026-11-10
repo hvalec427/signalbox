@@ -180,7 +180,7 @@ fn log_detail_lines(e: &LogEntry, show_framework: bool) -> Vec<String> {
                 .cloned(),
         );
         if hidden > 0 && !show_framework {
-            out.push(format!("  ({hidden} framework frames hidden — F to show)"));
+            out.push(format!("  ({hidden} library lines hidden — F to show)"));
         }
     }
     out
@@ -1696,7 +1696,7 @@ fn footer(view: &RnView, is_logs: bool) -> String {
                     " · n/N"
                 };
                 let frames = if is_logs {
-                    " · F framework frames"
+                    " · F show library code"
                 } else {
                     ""
                 };
@@ -2371,9 +2371,9 @@ fn handle_key(view: &mut RnView, key: KeyEvent, client: &RnClient) -> bool {
             keep_cursor_visible(view);
             view.flash = Some(
                 if view.show_framework {
-                    "showing framework frames"
+                    "showing library code"
                 } else {
-                    "hiding framework frames"
+                    "hiding library code"
                 }
                 .into(),
             );

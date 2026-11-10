@@ -76,7 +76,7 @@ const HELP_RIGHT: &[KeySection] = &[
             ("J K", "scroll it from the list"),
             ("{  }", "previous / next section"),
             ("o", "open file:line in nvim"),
-            ("F", "show framework stack frames"),
+            ("F", "show library code in stacks"),
         ],
     ),
     (
