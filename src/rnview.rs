@@ -1695,12 +1695,12 @@ fn footer(view: &RnView, is_logs: bool) -> String {
                 } else {
                     " · n/N"
                 };
-                let copy = if is_logs {
-                    " · F frames"
+                let frames = if is_logs {
+                    " · F framework frames"
                 } else {
-                    " · c curl"
+                    ""
                 };
-                return format!(" ⏎ open file / copy line · esc list · {{}} sect · / search{nn} · V select · y copy all{copy}{quit}");
+                return format!(" ⏎ open file · esc list · {{}} sect · / search{nn}{frames}{quit}");
             }
             let nn = if view.search.is_empty() {
                 ""
@@ -1717,7 +1717,7 @@ fn footer(view: &RnView, is_logs: bool) -> String {
             } else {
                 "keep"
             };
-            format!("{devs} / search{nn} · f filter · ⏎ detail · V select · y copy{netf} · c clear · p reload:{restart}{reload}{quit}")
+            format!("{devs} / search{nn} · f filter · ⏎ detail{netf} · c clear · p reload:{restart}{reload}{quit}")
         }
     }
 }
