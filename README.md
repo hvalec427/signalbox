@@ -16,6 +16,7 @@ signalbox down     # stop the `up` session in this checkout
 signalbox gc       # clean up after sessions that died (--sims: orphaned simulators)
 signalbox sim new --name X   # clone a ready simulator from the template, print its udid (yours to delete)
 signalbox mcp      # MCP server for coding agents (see below)
+signalbox feedback # report a bug or an idea about signalbox (see below)
 ```
 
 ## Install
@@ -109,12 +110,14 @@ so Metro and your builds use the same port. It defaults to `8081`.
 `⏎` to build & run on it. If it's a sim/emulator that isn't up yet, `⏎` boots it
 first — press `⏎` again once it shows `● running` (its id isn't known until then,
 and building early targets the wrong device). signalbox targets your pick with
-`--udid` (iOS) and `--deviceId` + the `ANDROID_SERIAL` env (Android).
+`--udid` (iOS simulator), `--device` (physical iPhone — `run-ios --udid` fails on
+those) and `--deviceId` + the `ANDROID_SERIAL` env (Android).
 
 If your build script ends in a `-- …` passthrough, an appended `--udid`/`--deviceId`
 would land on the wrong side of the `--` and be ignored. Put a **`{udid}`** (iOS) /
 **`{serial}`** (Android) placeholder in `ios.command` / `android.command` instead, so
-it lands exactly where you want — signalbox substitutes the selected device:
+it lands exactly where you want — signalbox substitutes the selected device (and
+rewrites `--udid {udid}` to `--device {udid}` for a physical iPhone):
 
 ```json
 "ios": { "command": "npx react-native run-ios --udid {udid} --scheme 'MyApp' -- --reset-cache" }
@@ -269,6 +272,7 @@ server on top of it for coding agents:
 | `output` | last lines of a process tab (build errors) |
 | `reload`, `rebuild`, `restart_metro` | drive the session |
 | `deeplinks` | the configured deep links (open them with `boop open`) |
+| `feedback` | report a bug or idea about signalbox itself (see [Feedback](#feedback)) |
 
 To see and use the app's screen (screenshots, element tree, taps, typing,
 deep links), use [boop](https://github.com/hvalec427/boop). Point it at
@@ -280,6 +284,33 @@ the session's device with `boop --device-from .signalbox/session.json …`.
 Claude Code: a plugin that gives each session in a React Native checkout its
 own simulator and Metro port, through `up --detach`, and an installer for
 signalbox, simon and boop.
+
+## Feedback
+
+Found a bug in signalbox, or missing something? Tell its maintainer:
+
+```sh
+signalbox feedback                                   # asks for a title and details
+signalbox feedback -t "Rebuild hangs on Android" -m "After …, I expected …"
+```
+
+It prints the item's number and link. Agents can do the same through the MCP
+`feedback` tool (a `title` and a `description`), meant for problems with
+signalbox itself, not with the app being worked on.
+
+Each item goes to signalbox's [feedbackBox](https://feedbackbox.homelab.hvalec.com)
+app with a little metadata: signalbox's version and channel, macOS version and
+architecture, whether it came from the CLI or MCP, and, when a session is
+running in the checkout, its platform, device name and OS version, bundle id,
+React Native version and Metro state. Never file paths, logs or errors.
+
+feedbackBox runs only on the homelab, so sending needs the home network or the
+tailnet.
+
+Release builds have the feedbackBox ingest key baked in. For a build of your
+own, put it in `.env` (see `.env.example`; `scripts/build-binaries.sh` loads it)
+or the environment when building (`SIGNALBOX_FEEDBACK_KEY=fbi_… cargo build`),
+or set it at runtime. `SIGNALBOX_FEEDBACK_URL` points it at another feedbackBox.
 
 ## Contributing
 

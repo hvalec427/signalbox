@@ -57,6 +57,7 @@ pub struct DashApp {
     focus: Pane,
     input_mode: bool,
     devices: Vec<DeviceRow>,
+    devices_loaded: bool, // the poller has sent its first list
     dev_sel: usize,
     rx: Receiver<DashMsg>,
     tx: Sender<DashMsg>,
@@ -191,6 +192,7 @@ impl DashApp {
         DashApp {
             ctl_rx,
             socket,
+            devices_loaded: false,
             ..DashApp::bare(project, pinned, client, tx, rx)
         }
     }
@@ -217,6 +219,7 @@ impl DashApp {
             focus: Pane::Processes,
             input_mode: false,
             devices: Vec::new(),
+            devices_loaded: true, // no poller to wait for
             dev_sel: 0,
             rx,
             tx,
@@ -527,6 +530,16 @@ impl DashApp {
                 .is_some_and(|p| p.simulator && p.udid == udid)
     }
 
+    fn is_physical_ios(&self, udid: &str) -> bool {
+        self.devices
+            .iter()
+            .any(|d| matches!(&d.open, Some(OpenTarget::IosPhysical(u)) if u == udid))
+            || self
+                .pinned
+                .as_ref()
+                .is_some_and(|p| !p.simulator && p.udid == udid)
+    }
+
     /// Once an iOS simulator build succeeds, make the app load from our Metro
     /// port. The port in the build (`RCT_METRO_PORT`) is ignored when React
     /// Native ships prebuilt, so set the app's `RCT_jsLocation` on that
@@ -779,11 +792,20 @@ impl DashApp {
         // for a plain `run-ios`, but a `--` in the script sends it to the wrong
         // side, so iOS also relies on the target already being booted; see below).
         let placeholder = if android { "{serial}" } else { "{udid}" };
+        // run-ios's `--udid` resolves a fallback simulator first and dies with
+        // "No simulator available with udid" for a physical device, so physical
+        // iPhones get `--device` instead.
+        let physical_ios = !android && id.as_deref().is_some_and(|u| self.is_physical_ios(u));
+        if physical_ios {
+            cmd = udid_flag_to_device(&cmd);
+        }
         if cmd.contains(placeholder) {
             cmd = cmd.replace(placeholder, id.as_deref().unwrap_or(""));
         } else if let Some(ref id) = id {
             let flag = if android {
                 format!("--deviceId {id}")
+            } else if physical_ios {
+                format!("--device {id}")
             } else {
                 format!("--udid {id}")
             };
@@ -1136,6 +1158,7 @@ impl DashApp {
                 match m {
                     DashMsg::Devices(v) => {
                         self.devices = v;
+                        self.devices_loaded = true;
                         if self.dev_sel >= self.devices.len() {
                             self.dev_sel = self.devices.len().saturating_sub(1);
                         }
@@ -1599,6 +1622,17 @@ fn render_devices(app: &mut DashApp, frame: &mut Frame, area: Rect) {
     };
 
     let mut lines: Vec<Line> = vec![metro_line, Line::raw("")];
+    if !app.devices_loaded {
+        // The first simctl/adb/devicectl pass takes a few seconds.
+        const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let frame_i = (app.started.elapsed().as_millis() / 100) as usize % SPINNER.len();
+        lines.push(Line::styled(
+            format!("  {} looking for devices…", SPINNER[frame_i]),
+            Style::default().fg(Color::DarkGray),
+        ));
+        frame.render_widget(Paragraph::new(Text::from(lines)), content);
+        return;
+    }
     if app.devices.is_empty() {
         lines.push(Line::styled(
             "  (no simulators/emulators found)",
@@ -1742,6 +1776,13 @@ fn render_status(app: &DashApp, frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(padded).style(style), area);
 }
 
+/// `--udid {udid}` → `--device {udid}` in an iOS command (the form run-ios
+/// needs for a physical device).
+fn udid_flag_to_device(cmd: &str) -> String {
+    cmd.replace("--udid {udid}", "--device {udid}")
+        .replace("--udid={udid}", "--device={udid}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::links::{picker_char, picker_index};
@@ -1856,6 +1897,38 @@ mod tests {
         snapshot("dashboard", &mut app, 100, 30);
         key(&mut app, KeyCode::Tab);
         snapshot("dashboard_devices_focused", &mut app, 100, 30);
+    }
+
+    #[test]
+    fn physical_ios_commands_use_device_instead_of_udid() {
+        assert_eq!(
+            udid_flag_to_device(
+                "npx react-native run-ios --udid {udid} --scheme 'A b' -- --reset-cache"
+            ),
+            "npx react-native run-ios --device {udid} --scheme 'A b' -- --reset-cache"
+        );
+        assert_eq!(
+            udid_flag_to_device("run-ios --udid={udid}"),
+            "run-ios --device={udid}"
+        );
+        assert_eq!(udid_flag_to_device("yarn ios"), "yarn ios");
+    }
+
+    #[test]
+    fn devices_pane_shows_loading_without_keys_until_the_first_list() {
+        let mut app = app();
+        let devices = std::mem::take(&mut app.devices);
+        app.devices_loaded = false;
+        let s = screen(&mut app, 100, 30);
+        assert!(s.contains("looking for devices…"), "{s}");
+        assert!(
+            !s.contains("no simulators") && !s.contains("b build"),
+            "{s}"
+        );
+        app.devices = devices;
+        app.devices_loaded = true;
+        let s = screen(&mut app, 100, 30);
+        assert!(s.contains("iPhone 16") && s.contains("b build"), "{s}");
     }
 
     #[test]
