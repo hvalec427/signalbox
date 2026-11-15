@@ -298,11 +298,14 @@ It prints the item's number and link. Agents can do the same through the MCP
 `feedback` tool (a `title` and a `description`), meant for problems with
 signalbox itself, not with the app being worked on.
 
-Each item goes to signalbox's [feedbackBox](https://feedbackbox.hvalec.com)
+Each item goes to signalbox's [feedbackBox](https://feedbackbox.homelab.hvalec.com)
 app with a little metadata: signalbox's version and channel, macOS version and
 architecture, whether it came from the CLI or MCP, and, when a session is
 running in the checkout, its platform, device name and OS version, bundle id,
 React Native version and Metro state. Never file paths, logs or errors.
+
+feedbackBox runs only on the homelab, so sending needs the home network or the
+tailnet.
 
 Release builds have the feedbackBox ingest key baked in. For a build of your
 own, put it in `.env` (see `.env.example`; `scripts/build-binaries.sh` loads it)

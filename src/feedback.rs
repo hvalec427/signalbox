@@ -14,7 +14,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-const DEFAULT_URL: &str = "https://feedbackbox.hvalec.com";
+const DEFAULT_URL: &str = "https://feedbackbox.homelab.hvalec.com";
 const BAKED_KEY: Option<&str> = option_env!("SIGNALBOX_FEEDBACK_KEY");
 const UA: &str = "signalbox-cli";
 const TIMEOUT: Duration = Duration::from_secs(15);
